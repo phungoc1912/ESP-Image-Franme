@@ -6,7 +6,7 @@
 // - Thêm #include <WiFiClientSecure.h> để sửa lỗi biên dịch.
 // - Thêm chức năng Wake-on-LAN qua Telegram.
 // - Cấu hình Chat ID và danh sách MAC qua Web Interface.
-// - Token Telegram được cung cấp: "7684333934:AAFezCNtnWrWWUjHZZ01pfc1YdrQ9eiidb8"
+// - Token Telegram được cung cấp: "Điền Token telegram ở đây"
 //=================================================================================================
 
 // --- CÁC THƯ VIỆN CẦN THIẾT ---
@@ -145,7 +145,7 @@ const char* WIFI_SSID_PATH = "/wifi_ssid.txt";
 const char* WIFI_PASS_PATH = "/wifi_pass.txt";
 
 // --- Telegram Bot & WOL Configuration ---
-#define TELEGRAM_BOT_TOKEN "7684333934:AAFezCNtnWrWWUjHZZ01pfc1YdrQ9eiidb8"
+#define TELEGRAM_BOT_TOKEN "Điền Token telegram ở đây"
 WiFiClientSecure clientSecure; // Cần cho UniversalTelegramBot
 UniversalTelegramBot bot(TELEGRAM_BOT_TOKEN, clientSecure);
 unsigned long bot_last_time = 0; // Thời gian cuối cùng kiểm tra tin nhắn bot
@@ -436,7 +436,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     <div class="section">
         <h2>Cấu hình Telegram & Wake-on-LAN</h2>
-        <p>Bot Token: <code>7684333934:AAFezCNtnWrWWUjHZZ01pfc1YdrQ9eiidb8</code> (đã được đặt cứng trong code)</p>
+        <p>Bot Token: <code>Điền Token telegram ở đây</code> (đã được đặt cứng trong code)</p>
         <form id="telegramConfigForm" method="POST" action="/savetelegramconfig">
             <label for="telegramChatId">Telegram Chat ID (được phép gửi lệnh):</label>
             <input type="text" id="telegramChatId" name="chatid" class="input-full-width">
