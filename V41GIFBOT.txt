@@ -1,0 +1,2320 @@
+//=================================================================================================
+// MÃ NGUỒN CHO ESP32 PHOTO FRAME (TFT DISPLAY - Arduino_GFX)
+// Version 42.2 (WOL_TELEGRAM_INTEGRATION - Debug Enhanced):
+// - Kích hoạt clientSecure.setInsecure() để gỡ lỗi SSL/TLS.
+// - Thêm log chi tiết trong handleTelegramBot().
+// - Thêm #include <WiFiClientSecure.h> để sửa lỗi biên dịch.
+// - Thêm chức năng Wake-on-LAN qua Telegram.
+// - Cấu hình Chat ID và danh sách MAC qua Web Interface.
+// - Token Telegram được cung cấp: "7684333934:AAFezCNtnWrWWUjHZZ01pfc1YdrQ9eiidb8"
+//=================================================================================================
+
+// --- CÁC THƯ VIỆN CẦN THIẾT ---
+#include <Arduino_GFX_Library.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h> // Đã thêm ở phiên bản trước
+#include <WebServer.h>      // SỬ DỤNG WebServer tích hợp
+#include "LittleFS.h"
+#include <TJpg_Decoder.h>
+#include <WiFiUdp.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <vector>
+#include <algorithm>
+#include <AnimatedGIF.h>
+#include "time.h"
+#include <math.h> // Thêm thư viện math.h để dùng hàm roundf
+
+// Thư viện cho Telegram Bot
+#include <UniversalTelegramBot.h>
+
+// --- Cấu hình ---
+const char* AP_SSID = "ESP32-PhotoFrame-Setup";
+const char* AP_PASSWORD = NULL; // Mở mạng AP nếu NULL
+
+// Màn hình TFT
+#define TFT_CS    18
+#define TFT_DC    16
+#define TFT_RST   17
+#define TFT_SCK   36
+#define TFT_MOSI  35
+#define TFT_MISO  -1 // Không sử dụng MISO cho màn hình này
+#define TFT_BL    37 // Đèn nền LED của màn hình nối vào chân 37 (S2 Mini D1)
+
+// Cấu hình cho đèn nền (sử dụng analogWrite)
+const char* BRIGHTNESS_CONFIG_PATH = "/brightness.txt";
+uint8_t currentBrightness = 255; // Giá trị độ sáng hiện tại (0-255), mặc định là sáng nhất
+
+Arduino_ESP32SPI bus(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, TFT_MISO);
+Arduino_ILI9341 gfx(&bus, TFT_RST);
+
+WebServer server(80);
+File fsUploadFile;
+bool g_uploadErrorOccurred = false;
+String g_uploadWarningMessage = ""; // Biến toàn cục để lưu trữ cảnh báo
+
+// Ngưỡng cảnh báo bộ nhớ (ví dụ: 200KB)
+const size_t LOW_MEMORY_THRESHOLD = 200 * 1024;
+bool littleFSReady = false; // Cờ trạng thái của LittleFS
+
+
+// NTP Settings for configTime()
+const char* ntpServerPrimary = "pool.ntp.org";
+const char* ntpServerSecondary = "time.google.com";
+const long  gmtOffset_sec = 7 * 3600; // GMT+7
+const int   daylightOffset_sec = 0; // Không có DST
+
+// --- Bố cục và Kích thước Màn hình ---
+uint16_t SCREEN_WIDTH_VAL = 320;
+uint16_t SCREEN_HEIGHT_VAL = 240;
+
+const int OVERLAY_HEIGHT = 40; // Chiều cao của vùng overlay dưới cùng (chứa đồng hồ, thời tiết)
+
+// Clock text display
+const int CLOCK_FONT_SIZE = 3;
+const int CLOCK_CHAR_HEIGHT = 8 * CLOCK_FONT_SIZE; // 24 pixels
+const int CLOCK_TEXT_X = 10; // Tọa độ X của đồng hồ
+const int CLOCK_TEXT_Y_OFFSET = (OVERLAY_HEIGHT - CLOCK_CHAR_HEIGHT) / 2; // (40-24)/2 = 8. Căn giữa theo chiều dọc
+
+// Weather text display
+const int WEATHER_TEXT_X_OFFSET = 115; // Vị trí bắt đầu của khối thời tiết, tính từ mép trái màn hình
+const int WEATHER_FONT_SIZE = 1;
+const int WEATHER_CHAR_PIXEL_HEIGHT = 8 * WEATHER_FONT_SIZE; // Chiều cao thực tế của 1 dòng chữ thời tiết
+const int WEATHER_TEXT_Y_OFFSET = (OVERLAY_HEIGHT - WEATHER_CHAR_PIXEL_HEIGHT) / 2; // (40-8)/2 = 16. Dòng đầu tiên sẽ ở vị trí này.
+const int WEATHER_LINE_SPACING = 2; // Khoảng cách điểm ảnh giữa dòng nhiệt độ và dòng mô tả
+
+
+// GIF display settings
+#define DISPLAY_DPI 110 // DPI ước tính của màn hình (cần điều chỉnh cho chính xác)
+const float GIF_TARGET_HEIGHT_CM = 1.5; // Chiều cao mong muốn của GIF trên màn hình (cm)
+const float GIF_TARGET_WIDTH_CM = 1.5;  // Chiều rộng mong muốn của GIF trên màn hình (cm)
+const float INCH_TO_CM = 2.54;
+
+int GIF_TARGET_PIXEL_HEIGHT; // Sẽ được tính toán trong setup()
+int GIF_TARGET_PIXEL_WIDTH;  // Sẽ được tính toán trong setup()
+int GIF_AREA_X;              // Tọa độ X của vùng GIF (góc trên trái)
+int GIF_AREA_Y;              // Tọa độ Y của vùng GIF (góc trên trái)
+const int GIF_MARGIN = 5;    // Khoảng cách từ mép màn hình/overlay đến GIF
+const int MAX_GIF_DIMENSION = 480;  // Giới hạn kích thước GIF gốc để tránh quá tải bộ nhớ
+
+// Background image settings
+String currentBackgroundImagePath = "";
+unsigned long lastImageChangeTime = 0;
+const long imageChangeInterval = 30000; // 30 giây đổi ảnh nền
+
+// GIF animation variables
+AnimatedGIF gif;
+String currentAnimationPath = ""; // Đường dẫn đến file GIF đang được phát hoặc sẽ phát
+File gifFileHandle; // Biến toàn cục cho file GIF, được quản lý bởi AnimatedGIF
+String lastGifPlayed = "";    // Theo dõi file GIF đã phát cuối cùng để tránh lặp lại ngay
+std::vector<String> animationFilesList; // Danh sách các file GIF có sẵn
+
+// --- GIF Background and Double Buffering ---
+uint16_t* gifBackgroundBuffer = nullptr; // Buffer để lưu phần ảnh nền tĩnh phía sau GIF
+uint16_t* gifActiveBuffer = nullptr;     // Buffer hoạt động để vẽ GIF (Double Buffering)
+bool g_isCapturingForGifBackgroundBuffer = false;  // Cờ báo cho callback biết có đang capture cho buffer nền không
+int g_captureSourceImgX = 0;
+int g_captureSourceImgY = 0;
+int g_captureSourceWidth = 0;
+int g_captureSourceHeight = 0;
+bool needsGifBackgroundUpdate = true;
+String lastCapturedBackgroundImagePath = "";
+
+enum GIFDrawTarget { DRAW_TO_SCREEN, DRAW_TO_ACTIVE_BUFFER };
+GIFDrawTarget currentGifDrawTarget = DRAW_TO_ACTIVE_BUFFER;
+
+// Weather settings
+String openWeatherMapApiKey = "7b6175c7486e498e90b7cfe5f81bc908";
+String city = "Vinh Phuc";
+String countryCode = "VN";
+const char* WEATHER_CONFIG_PATH = "/weather_cfg.json";
+unsigned long weatherUpdateInterval = 5 * 60 * 1000; // 5 phút
+
+String currentWeatherIconCode = "unknown";
+String currentWeatherDescription = "Dang tai...";
+float currentTemperature = -999.0f;
+unsigned long lastWeatherUpdateTime = 0;
+unsigned long lastOverlayRedrawTime = 0;
+int lastMinuteDisplayed = -1;
+
+// WiFi credentials storage
+String wifi_ssid_stored = "";
+String wifi_password_stored = "";
+bool wifiManagerMode = false;
+const char* WIFI_SSID_PATH = "/wifi_ssid.txt";
+const char* WIFI_PASS_PATH = "/wifi_pass.txt";
+
+// --- Telegram Bot & WOL Configuration ---
+#define TELEGRAM_BOT_TOKEN "7684333934:AAFezCNtnWrWWUjHZZ01pfc1YdrQ9eiidb8"
+WiFiClientSecure clientSecure; // Cần cho UniversalTelegramBot
+UniversalTelegramBot bot(TELEGRAM_BOT_TOKEN, clientSecure);
+unsigned long bot_last_time = 0; // Thời gian cuối cùng kiểm tra tin nhắn bot
+const int BOT_MTBS = 1000; // Thời gian giữa các lần kiểm tra tin nhắn (ms)
+
+String authorizedTelegramChatId = ""; // Sẽ được load từ file config
+const char* TELEGRAM_CONFIG_PATH = "/telegram_cfg.json";
+
+struct WolDevice {
+  String name;
+  String mac;
+};
+std::vector<WolDevice> wolDeviceList;
+
+// Color definitions
+uint16_t COL_BLACK;
+uint16_t COL_WHITE;
+uint16_t COL_RED;
+uint16_t COL_GREEN;
+uint16_t COL_BLUE;
+uint16_t COL_YELLOW;
+uint16_t COL_DARKGREY;
+uint16_t COL_LIGHTGREY;
+uint16_t COL_CYAN;
+
+// --- Forward Declarations ---
+void GIFDrawCallback(GIFDRAW *pDraw);
+void * GIFOpenFileLFS(const char *fname, int32_t *pFileSize);
+void GIFCloseFileLFS(void *pHandle);
+int32_t GIFReadFileLFS(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen);
+int32_t GIFSeekFileLFS(GIFFILE *pFile, int32_t iPosition);
+
+bool tft_output_callback_jpeg(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap);
+bool tft_output_to_gif_background_buffer_callback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap_data);
+void captureAndStoreGifBackground();
+
+void drawFsImage(const String& path, int x_pos, int y_pos, int w_max = 0, int h_max = 0);
+void displayRandomBackgroundImage();
+void scanAnimationFiles();
+void drawAnimation();
+void drawTextWithOutline(const String& text, int16_t x, int16_t y, uint16_t fgColor, uint16_t outlineColor, uint8_t textSize);
+void drawClockDisplay(struct tm *pTimeinfo, bool timeIsValid);
+void fetchWeatherData();
+String convertToNonAccentVietnamese(String text);
+String getVietnameseWeatherDescription(String iconCode, String apiDescription);
+void drawWeatherInfo();
+String urlEncode(String str);
+void handleUpload();
+void handleUploadFinal(String successMessage);
+void handleRoot();
+void handleListFilesAPI();
+void handleDeleteFileAPI();
+void handleReboot();
+bool loadWiFiCredentials();
+void saveWiFiCredentials(const String& ssid, const String& password);
+void deleteWiFiCredentials();
+void startAPMode();
+void startSTAModeAndMainApp();
+void handleWifiConfigRoot();
+void handleWifiSave();
+void handleScanWifi();
+void handleNotFound();
+void handleGetWeatherConfig();
+void handleSaveWeatherConfig();
+void loadWeatherConfig();
+void handleSTAWifiSetupPage();
+void handleGetCurrentSsid();
+void handleStorageInfo();
+void handleSetBrightness();
+void handleGetBrightness();
+void saveBrightnessSetting(uint8_t brightness);
+void loadBrightnessSetting();
+void setBacklightBrightness(uint8_t brightness);
+void handleDeleteWifi();
+
+// Telegram & WOL handlers
+void handleTelegramBot();
+void sendWolPacket(const String& macAddress);
+bool parseMacAddress(const String& macStr, uint8_t* macBytes);
+void handleGetTelegramConfig();
+void handleSaveTelegramConfig();
+void loadTelegramConfig();
+String getDeviceMacByName(const String& deviceNameOrMac);
+
+
+// --- HTML Content (cho WebServer) ---
+const char wifi_config_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+<title>Cau Hinh WiFi</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" charset="UTF-8">
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+  .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+  h1 { color: #007bff; text-align: center; }
+  label { display: block; margin-top: 15px; margin-bottom: 5px; font-weight: bold; }
+  input[type="text"], input[type="password"], select, textarea { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;}
+  button, input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-top:10px; }
+  button:hover, input[type="submit"]:hover { background-color: #0056b3; }
+  .scan-btn { background-color: #28a745; }
+  .scan-btn:hover { background-color: #218838; }
+  #status { margin-top: 15px; padding: 10px; background-color: #e9ecef; border-radius: 4px; text-align: center; }
+  .hidden { display: none; }
+  ul { list-style: none; padding:0; }
+  li { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+  li:hover { background-color: #f0f0f0; }
+  li:last-child { border-bottom: none; }
+  .back-link { display: block; text-align: center; margin-top: 20px; color: #007bff; text-decoration: none;}
+</style>
+</head><body>
+<div class="container">
+  <h1>Cấu hình WiFi</h1>
+  <form id="wifiForm" method="POST" action="/wifisave"> <label for="ssid_list">Chọn WiFi (hoặc nhập SSID bên dưới):</label>
+    <select id="ssid_list" name="ssid_select">
+      <option value="">-- Quét để chọn --</option>
+    </select>
+    <button type="button" class="scan-btn" onclick="scanWifi()">Quét WiFi xung quanh</button>
+
+    <label for="ssid">Hoặc nhập SSID:</label>
+    <input type="text" id="ssid_manual" name="ssid_manual" placeholder="Tên mạng WiFi">
+
+    <label for="password">Mật khẩu:</label>
+    <input type="password" id="password" name="password" placeholder="Mật khẩu mạng WiFi">
+
+    <input type="submit" value="Lưu và Kết nối">
+  </form>
+  <div id="status"></div>
+  <div id="wifi_networks_title" class="hidden"><h3>Mạng Wifi tìm thấy:</h3></div>
+  <ul id="wifi_list_clickable"></ul>
+  <a href="/" class="back-link" id="backLink">Quay lại trang chính</a>
+</div>
+<script>
+function scanWifi() {
+  document.getElementById('status').textContent = 'Đang quét WiFi...';
+  document.getElementById('wifi_networks_title').classList.remove('hidden');
+  const ssidListDropdown = document.getElementById('ssid_list');
+  const wifiUlClickable = document.getElementById('wifi_list_clickable');
+  ssidListDropdown.innerHTML = '<option value="">-- Đang quét... --</option>';
+  wifiUlClickable.innerHTML = '';
+
+  fetch('/scanwifi')
+    .then(response => {
+        if (!response.ok) { throw new Error('Lỗi server khi quét WiFi: ' + response.status); }
+        return response.json();
+    })
+    .then(data => {
+      ssidListDropdown.innerHTML = '<option value="">-- Chọn từ danh sách --</option>';
+      if (data.length > 0) {
+        data.forEach(network => {
+          const option = document.createElement('option');
+          option.value = network.ssid;
+          option.textContent = `${network.ssid} (${network.rssi}dBm, ${network.secure ? 'Bảo mật' : 'Mở'})`;
+          ssidListDropdown.appendChild(option);
+
+          const li = document.createElement('li');
+          li.textContent = `${network.ssid} (${network.rssi}dBm, ${network.secure ? 'Bảo mật' : 'Mở'})`;
+          li.onclick = () => {
+            document.getElementById('ssid_manual').value = network.ssid;
+            ssidListDropdown.value = network.ssid; 
+            document.getElementById('password').focus();
+          };
+          wifiUlClickable.appendChild(li);
+        });
+        document.getElementById('status').textContent = 'Quét hoàn tất. Chọn một mạng.';
+      } else {
+        document.getElementById('status').textContent = 'Không tìm thấy mạng WiFi nào.';
+        ssidListDropdown.innerHTML = '<option value="">-- Không tìm thấy --</option>';
+      }
+    })
+    .catch(error => {
+      console.error('Lỗi quét WiFi:', error);
+      document.getElementById('status').textContent = 'Lỗi khi quét WiFi. ' + error.message;
+      ssidListDropdown.innerHTML = '<option value="">-- Lỗi quét --</option>';
+    });
+}
+document.getElementById('ssid_list').addEventListener('change', function() {
+    if (this.value) { 
+        document.getElementById('ssid_manual').value = this.value;
+        document.getElementById('password').focus();
+    }
+});
+document.getElementById('wifiForm').addEventListener('submit', function(e) {
+    const manualSSID = document.getElementById('ssid_manual').value.trim();
+    const selectedSSID = document.getElementById('ssid_list').value;
+    const finalSSID = manualSSID || selectedSSID; 
+
+    if (!finalSSID) {
+        alert('Vui lòng chọn hoặc nhập SSID.');
+        e.preventDefault();
+        return;
+    }
+    document.getElementById('ssid_manual').value = finalSSID;
+    document.getElementById('status').textContent = 'Đang lưu và thử kết nối... Vui lòng đợi.';
+});
+if (window.location.hostname.includes("192.168.4.1")) {
+    const backLink = document.getElementById('backLink');
+    if (backLink) backLink.style.display = 'none';
+}
+</script>
+</body></html>
+)rawliteral";
+
+// File Management Page
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+  <title>ESP Image Frame Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" charset="UTF-8">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333; }
+    .container { max-width: 800px; margin: auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+    h1, h2, h3 { color: #007bff; }
+    input[type="file"], input[type="submit"], button, input[type="text"], input[type="range"], textarea { 
+        margin-top: 10px; padding: 10px; border-radius: 4px; border: 1px solid #ddd; margin-right: 10px; box-sizing: border-box; 
+    }
+    textarea { width: calc(100% - 20px); min-height: 80px;}
+    input[type="submit"], button { background-color: #007bff; color: white; cursor: pointer; border:none; }
+    input[type="submit"]:hover, button:hover { background-color: #0056b3; }
+    .delete-wifi-btn { background-color: #ffc107; color: black; } 
+    .delete-wifi-btn:hover { background-color: #e0a800; }
+    .file-list { list-style: none; padding: 0; }
+    .file-list li { background-color: #eee; padding: 8px; margin-bottom: 5px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+    .file-list button { background-color: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+    .file-list button:hover { background-color: #c82333; }
+    .section { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #eee; }
+    .section:last-child { border-bottom: none; }
+    .status { margin-top:10px; padding:10px; background-color:#e9ecef; border-radius:4px; font-style:italic; }
+    .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; } 
+    label { display: block; margin-top: 10px; font-weight: bold;}
+    .storage-info { padding: 10px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: .25rem; margin-bottom: 1rem; }
+    .brightness-control { display: flex; align-items: center; gap: 10px; margin-bottom:10px;}
+    .brightness-control input[type="range"] { flex-grow: 1; margin-top:0; padding:0;}
+    .brightness-control span { min-width: 30px; text-align: right;}
+    .input-full-width { width: calc(100% - 22px) !important; }
+  </style>
+</head><body>
+  <div class="container">
+    <h1>Quản lý khung ảnh</h1>
+
+    <div class="section">
+        <h2>Thông tin bộ nhớ</h2>
+        <div id="storageStatus" class="storage-info">Đang tải thông tin bộ nhớ...</div>
+    </div>
+    
+    <div class="section">
+        <h2>Thay đổi độ sáng màn hình</h2>
+        <label for="brightnessSlider">Độ sáng:</label>
+        <div class="brightness-control">
+            <input type="range" id="brightnessSlider" min="0" max="100" value="100">
+            <span id="brightnessValue">100%</span>
+        </div>
+        <div id="statusBrightness" class="status"></div>
+    </div>
+
+    <div class="section">
+      <h2>Ảnh nền (JPEG)</h2>
+      <form id="uploadFormImage" method="POST" action="/upload-image" enctype="multipart/form-data">
+        <input type="file" name="file_upload" id="fileImage" accept=".jpg,.jpeg" required>
+        <input type="submit" value="Tải ảnh lên">
+      </form>
+      <div id="statusImage" class="status"></div>
+      <h3>Ảnh đã tải lên (/img):</h3>
+      <ul id="imageList" class="file-list"></ul>
+    </div>
+
+    <div class="section">
+      <h2>Ảnh động (GIF)</h2>
+      <form id="uploadFormAnim" method="POST" action="/upload-anim" enctype="multipart/form-data">
+        <input type="file" name="file_upload" id="fileAnim" accept=".gif,.GIF" required>
+        <input type="submit" value="Tải ảnh động GIF">
+      </form>
+      <div id="statusAnim" class="status"></div>
+      <h3>Ảnh động đã tải lên (/anim):</h3>
+      <ul id="animList" class="file-list"></ul>
+    </div>
+
+    <div class="section">
+      <h2>Cấu hình thời tiết</h2>
+      <form id="weatherConfigForm" method="POST" action="/saveweatherconfig">
+        <label for="apiKey">OpenWeatherMap API Key:</label>
+        <input type="text" id="apiKey" name="apikey" class="input-full-width">
+        <label for="city">Thành phố (không dấu, VD: Ha Noi):</label>
+        <input type="text" id="city" name="city" class="input-full-width">
+        <label for="countryCode">Mã Quốc gia (VD: VN):</label>
+        <input type="text" id="countryCode" name="countrycode" class="input-full-width">
+        <input type="submit" value="Lưu cấu hình thời tiết">
+      </form>
+      <div id="statusWeatherConfig" class="status"></div>
+    </div>
+
+    <div class="section">
+        <h2>Cấu hình Telegram & Wake-on-LAN</h2>
+        <p>Bot Token: <code>7684333934:AAFezCNtnWrWWUjHZZ01pfc1YdrQ9eiidb8</code> (đã được đặt cứng trong code)</p>
+        <form id="telegramConfigForm" method="POST" action="/savetelegramconfig">
+            <label for="telegramChatId">Telegram Chat ID (được phép gửi lệnh):</label>
+            <input type="text" id="telegramChatId" name="chatid" class="input-full-width">
+            
+            <label for="wolDevices">Danh sách thiết bị WOL (Tên=MAC, mỗi thiết bị một dòng):</label>
+            <textarea id="wolDevices" name="woldevices" placeholder="Ví dụ:\nMyPC=00:11:22:AA:BB:CC\nServerLuuTru=DE:AD:BE:EF:01:23" class="input-full-width"></textarea>
+            <input type="submit" value="Lưu cấu hình Telegram & WOL">
+        </form>
+        <div id="statusTelegramConfig" class="status"></div>
+    </div>
+
+    <div class="section">
+        <h2>Cấu hình WiFi (STA Mode)</h2>
+        <p>SSID hiện tại: <strong id="currentSsid">Đang tải...</strong></p>
+        <button onclick="window.location.href='/wifisetup'">Thay đổi cấu hình WiFi</button>
+        <button onclick="deleteSavedWifi()" class="delete-wifi-btn">Xóa WiFi đã lưu & Khởi động lại</button>
+        <div id="statusWifiManage" class="status"></div>
+    </div>
+
+      <div class="section">
+        <h2>Hành động</h2>
+        <button onclick="rebootDevice()">Khởi động lại thiết bị</button>
+        <div id="statusAction" class="status"></div>
+    </div>
+  </div>
+
+<script>
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+function fetchStorageInfo() {
+    const storageElement = document.getElementById('storageStatus');
+    storageElement.textContent = 'Đang tải thông tin bộ nhớ...';
+    storageElement.classList.remove('warning'); 
+
+    fetch('/storageinfo')
+        .then(response => {
+            if (!response.ok) {
+                return response.text().then(text => {
+                    throw new Error(`Lỗi server: ${response.status} ${response.statusText}. Chi tiết: ${text}`);
+                });
+            }
+            return response.json();
+        })
+        .then(data => {
+            if (data.error) { 
+                throw new Error('Lỗi từ server: ' + data.error);
+            }
+            storageElement.innerHTML = `Tổng: ${formatBytes(data.total)} | Đã dùng: ${formatBytes(data.used)} | Còn trống: ${formatBytes(data.free)}`;
+            if (data.low_memory_warning) {
+                storageElement.classList.add('warning');
+                storageElement.innerHTML += " (Bộ nhớ thấp!)";
+            }
+        })
+        .catch(error => {
+            console.error('Lấy thông tin bộ nhớ:', error);
+            storageElement.textContent = 'Không thể lấy thông tin bộ nhớ. ' + error.message;
+            storageElement.classList.add('warning');
+        });
+}
+
+
+function fetchFiles(listId, dirPath, statusId) {
+  const listElement = document.getElementById(listId);
+  const statusElement = document.getElementById(statusId);
+  statusElement.textContent = 'Đang tải danh sách tệp...';
+  listElement.innerHTML = '';
+
+  fetch('/list-files?path=' + dirPath)
+    .then(response => {
+      if (!response.ok) throw new Error('Network response was not ok: ' + response.statusText);
+      return response.json();
+    })
+    .then(data => {
+      if (data.length === 0) {
+        listElement.innerHTML = '<li>Không có tệp nào.</li>';
+      } else {
+        data.forEach(file => {
+          const li = document.createElement('li');
+          li.textContent = file.name;
+          const deleteButton = document.createElement('button');
+          deleteButton.textContent = 'Xoa';
+          deleteButton.onclick = () => {
+            deleteFile(file.path, listId, dirPath, statusId);
+          };
+          li.appendChild(deleteButton);
+          listElement.appendChild(li);
+        });
+      }
+      statusElement.textContent = 'Danh sách tệp đã được cập nhật.';
+    })
+    .catch(error => {
+        console.error('Lỗi tải danh sách tệp cho ' + dirPath + ':', error);
+        statusElement.textContent = 'Lỗi tải danh sách tệp: ' + error.message;
+        listElement.innerHTML = '<li>Không thể tải danh sách tệp.</li>';
+    });
+}
+
+function deleteFile(filePath, listIdToUpdate, dirPathForUpdate, statusIdToUpdate) {
+  if (!confirm('Bạn có chắc muốn xóa ' + filePath + '?')) return;
+  const formData = new URLSearchParams();
+  formData.append('path', filePath);
+
+  fetch('/delete-file', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formData
+  })
+    .then(response => response.text().then(text => ({ ok: response.ok, text })))
+    .then(({ok, text}) => {
+      alert(text);
+      document.getElementById(statusIdToUpdate).textContent = text;
+      if (ok) {
+        fetchFiles(listIdToUpdate, dirPathForUpdate, statusIdToUpdate);
+        fetchStorageInfo(); 
+      }
+    })
+    .catch(error => {
+        console.error('Lỗi xóa tệp:', error);
+        alert('Lỗi xóa tệp: ' + error);
+        document.getElementById(statusIdToUpdate).textContent = 'Lỗi xóa tệp: ' + error.message;
+    });
+}
+
+function setupUploadForm(formId, uploadUrl, fileInputId, listIdToUpdate, dirPathForUpdate, statusId) {
+    document.getElementById(formId).addEventListener('submit', function(event) {
+        event.preventDefault();
+        const formData = new FormData();
+        const fileInput = document.getElementById(fileInputId);
+        const statusElement = document.getElementById(statusId);
+        statusElement.classList.remove('warning'); 
+
+        if (fileInput.files.length === 0) {
+            alert('Vui lòng chọn một tệp để tải lên.');
+            statusElement.textContent = 'Vui lòng chọn một tệp.';
+            return;
+        }
+        formData.append(fileInput.name, fileInput.files[0]);
+        statusElement.textContent = 'Đang tải lên ' + fileInput.files[0].name + '...';
+
+        fetch(uploadUrl, { method: 'POST', body: formData })
+            .then(response => {
+                const warningHeader = response.headers.get('X-Upload-Warning');
+                return response.text().then(text => ({ ok: response.ok, status: response.status, text, warning: warningHeader }));
+            })
+            .then(({ok, status, text, warning}) => {
+                statusElement.textContent = text;
+                if (warning) { 
+                    statusElement.textContent += " " + warning;
+                    statusElement.classList.add('warning'); 
+                }
+                if (ok) {
+                    fileInput.value = ''; 
+                    fetchFiles(listIdToUpdate, dirPathForUpdate, statusId);
+                    fetchStorageInfo(); 
+                } else {
+                   statusElement.textContent += " (Lỗi: " + status + ")";
+                   alert("Lỗi tải lên: " + text);
+                }
+            })
+            .catch(error => {
+                console.error('Lỗi tải lên:', error);
+                alert('Tải lên thất bại: ' + error);
+                statusElement.textContent = 'Tải lên thất bại: ' + error.message;
+            });
+    });
+}
+function rebootDevice() {
+    if (!confirm('Bạn có muốn khởi động lại thiết bị?')) return;
+    const statusElement = document.getElementById('statusAction');
+    statusElement.textContent = 'Đang gửi lệnh khởi động lại...';
+    fetch('/reboot', { method: 'POST' })
+        .then(response => response.text().then(text => ({ ok: response.ok, text })))
+        .then(({ok, text}) => {
+            statusElement.textContent = text;
+            if (ok) {
+                alert('Thiết bị sẽ khởi động lại.');
+            } else {
+                alert('Lỗi: ' + text);
+            }
+        })
+        .catch(error => {
+            console.error('Lỗi khởi động lại:', error);
+            statusElement.textContent = 'Lỗi khởi động lại: ' + error.message;
+            alert('Lỗi khởi động lại: ' + error.message);
+        });
+}
+
+function loadWeatherConfig() {
+    fetch('/getweatherconfig')
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById('apiKey').value = data.apikey || '';
+            document.getElementById('city').value = data.city || '';
+            document.getElementById('countryCode').value = data.countrycode || '';
+        })
+        .catch(error => console.error('Error loading weather config:', error));
+}
+
+document.getElementById('weatherConfigForm').addEventListener('submit', function(event) {
+    event.preventDefault();
+    const formData = new FormData(this);
+    const statusElement = document.getElementById('statusWeatherConfig');
+    statusElement.textContent = 'Đang lưu cấu hình thời tiết...';
+
+    fetch('/saveweatherconfig', { method: 'POST', body: formData })
+        .then(response => response.text().then(text => ({ ok: response.ok, text })))
+        .then(({ok, text}) => {
+            statusElement.textContent = text;
+            if (!ok) {
+                alert("Lỗi lưu cấu hình: " + text);
+            } else {
+                alert("Đã lưu cấu hình thời tiết!");
+            }
+        })
+        .catch(error => {
+            console.error('Lỗi lưu cấu hình thời tiết:', error);
+            statusElement.textContent = 'Lỗi lưu cấu hình: ' + error.message;
+            alert('Lỗi lưu cấu hình thời tiết.');
+        });
+});
+
+// Load and Save Telegram/WOL Config
+function loadTelegramConfig() {
+    fetch('/gettelegramconfig')
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById('telegramChatId').value = data.chat_id || '';
+            let devicesText = "";
+            if (data.wol_devices && data.wol_devices.length > 0) {
+                data.wol_devices.forEach(device => {
+                    devicesText += device.name + "=" + device.mac + "\n";
+                });
+            }
+            document.getElementById('wolDevices').value = devicesText.trim();
+        })
+        .catch(error => console.error('Error loading Telegram/WOL config:', error));
+}
+
+document.getElementById('telegramConfigForm').addEventListener('submit', function(event) {
+    event.preventDefault();
+    const formData = new FormData(this);
+    const statusElement = document.getElementById('statusTelegramConfig');
+    statusElement.textContent = 'Đang lưu cấu hình Telegram & WOL...';
+
+    fetch('/savetelegramconfig', { method: 'POST', body: formData })
+        .then(response => response.text().then(text => ({ ok: response.ok, text })))
+        .then(({ok, text}) => {
+            statusElement.textContent = text;
+            if (!ok) {
+                alert("Lỗi lưu cấu hình: " + text);
+            } else {
+                alert("Đã lưu cấu hình Telegram & WOL!");
+            }
+        })
+        .catch(error => {
+            console.error('Lỗi lưu cấu hình Telegram & WOL:', error);
+            statusElement.textContent = 'Lỗi lưu cấu hình: ' + error.message;
+            alert('Lỗi lưu cấu hình Telegram & WOL.');
+        });
+});
+
+
+function getCurrentSsid() {
+    fetch('/getcurrentssid')
+        .then(response => {
+            if (!response.ok) throw new Error('Failed to get SSID');
+            return response.text();
+        })
+        .then(ssid => {
+            document.getElementById('currentSsid').textContent = ssid || 'Không kết nối';
+        })
+        .catch(error => {
+            console.error('Error getting current SSID:', error);
+            document.getElementById('currentSsid').textContent = 'Không thể lấy';
+        });
+}
+
+const brightnessSlider = document.getElementById('brightnessSlider');
+const brightnessValueDisplay = document.getElementById('brightnessValue');
+const statusBrightness = document.getElementById('statusBrightness');
+
+function fetchBrightness() {
+    fetch('/get-brightness')
+        .then(response => response.json())
+        .then(data => {
+            const brightnessPercent = Math.round((data.brightness / 255) * 100);
+            brightnessSlider.value = brightnessPercent;
+            brightnessValueDisplay.textContent = brightnessPercent + '%';
+            statusBrightness.textContent = 'Đã tải độ sáng hiện tại.';
+        })
+        .catch(error => {
+            console.error('Lỗi lấy độ sáng:', error);
+            statusBrightness.textContent = 'Lỗi lấy độ sáng.';
+        });
+}
+
+brightnessSlider.addEventListener('input', function() {
+    brightnessValueDisplay.textContent = this.value + '%';
+});
+
+brightnessSlider.addEventListener('change', function() {
+    const brightnessPercent = parseInt(this.value);
+    const brightnessDeviceValue = Math.round((brightnessPercent / 100) * 255);
+
+    statusBrightness.textContent = 'Đang cập nhật độ sáng...';
+    fetch('/set-brightness?value=' + brightnessDeviceValue, { method: 'POST' })
+        .then(response => response.text())
+        .then(text => {
+            statusBrightness.textContent = text;
+        })
+        .catch(error => {
+            console.error('Lỗi đặt độ sáng:', error);
+            statusBrightness.textContent = 'Lỗi cập nhật độ sáng.';
+            fetchBrightness(); 
+        });
+});
+
+function deleteSavedWifi() {
+    if (!confirm('Bạn có chắc muốn xóa thông tin WiFi đã lưu? Thiết bị sẽ khởi động lại ở chế độ AP.')) return;
+    const statusElement = document.getElementById('statusWifiManage');
+    statusElement.textContent = 'Đang gửi yêu cầu xóa WiFi và khởi động lại thiết bị...';
+
+    fetch('/deletewifi', { method: 'POST' })
+        .then(response => {
+            if (!response.ok) {
+                return response.text().then(text => Promise.reject(new Error(text || `Lỗi từ server: ${response.status}`)));
+            }
+            return response.text(); 
+        })
+        .then(text => { 
+            statusElement.textContent = text; 
+            alert(text); 
+            document.getElementById('currentSsid').textContent = 'Không kết nối (đang khởi động lại)';
+        })
+        .catch(error => { 
+            console.error('Lỗi khi thực hiện /deletewifi:', error);
+            let userMessage = 'Yêu cầu xóa WiFi đã được gửi. ';
+
+            if (error.message && error.message.toLowerCase().includes('failed to fetch')) {
+                userMessage += 'Thiết bị có thể đang khởi động lại ở chế độ AP. Vui lòng kiểm tra mạng WiFi "ESP32-PhotoFrame-Setup" sau ít phút.';
+            } else {
+                userMessage += 'Đã xảy ra lỗi: ' + error.message;
+            }
+            
+            statusElement.textContent = userMessage;
+            alert(userMessage);
+            document.getElementById('currentSsid').textContent = 'Không kết nối (chờ khởi động lại)';
+        });
+}
+
+setupUploadForm('uploadFormImage', '/upload-image', 'fileImage', 'imageList', '/img/', 'statusImage');
+setupUploadForm('uploadFormAnim', '/upload-anim', 'fileAnim', 'animList', '/anim/', 'statusAnim');
+
+fetchFiles('imageList', '/img/', 'statusImage');
+fetchFiles('animList', '/anim/', 'statusAnim');
+
+loadWeatherConfig();
+loadTelegramConfig(); // Load Telegram config on page load
+getCurrentSsid();
+fetchBrightness(); 
+
+document.addEventListener('DOMContentLoaded', function() {
+    fetchStorageInfo();
+});
+
+</script>
+</body></html>
+)rawliteral";
+
+
+// --- GIF Support Functions ---
+void GIFDrawCallback(GIFDRAW *pDraw) {
+    uint8_t *s = pDraw->pPixels;      
+    uint16_t *pPal = pDraw->pPalette; 
+
+    if (!s || !pPal || !gif.getCanvasWidth() || !gif.getCanvasHeight() || gif.getCanvasWidth() == 0 || gif.getCanvasHeight() == 0) {
+        return;
+    }
+    if (currentGifDrawTarget != DRAW_TO_ACTIVE_BUFFER || !gifActiveBuffer) {
+        return;
+    }
+
+    float scaleX = (float)GIF_TARGET_PIXEL_WIDTH / (float)gif.getCanvasWidth();
+    float scaleY = (float)GIF_TARGET_PIXEL_HEIGHT / (float)gif.getCanvasHeight();
+    int gif_line_y = pDraw->iY + pDraw->y;
+    int16_t screen_y_start_on_target = roundf((float)gif_line_y * scaleY);
+    int16_t screen_y_end_on_target = roundf((float)(gif_line_y + 1) * scaleY) - 1;
+
+    if (screen_y_start_on_target > screen_y_end_on_target) { 
+        if (roundf((float)(gif_line_y + 1) * scaleY) > roundf((float)gif_line_y * scaleY) ) {
+             screen_y_end_on_target = screen_y_start_on_target; 
+        } else {
+            return; 
+        }
+    }
+    
+    for (int i = 0; i < pDraw->iWidth; i++) { 
+        if (s[i] == pDraw->ucTransparent) {
+            continue; 
+        }
+        int gif_pixel_x = pDraw->iX + i;
+        int16_t screen_x_start_on_target = roundf((float)gif_pixel_x * scaleX);
+        int16_t screen_x_end_on_target = roundf((float)(gif_pixel_x + 1) * scaleX) - 1;
+
+        if (screen_x_start_on_target > screen_x_end_on_target) {
+            if (roundf((float)(gif_pixel_x + 1) * scaleX) > roundf((float)gif_pixel_x * scaleX) ) {
+                screen_x_end_on_target = screen_x_start_on_target; 
+            } else {
+                continue; 
+            }
+        }
+        uint16_t color = pPal[s[i]];
+        for (int16_t sy_rel = screen_y_start_on_target; sy_rel <= screen_y_end_on_target; sy_rel++) {
+            if (sy_rel < 0 || sy_rel >= GIF_TARGET_PIXEL_HEIGHT) continue;
+            for (int16_t sx_rel = screen_x_start_on_target; sx_rel <= screen_x_end_on_target; sx_rel++) {
+                if (sx_rel < 0 || sx_rel >= GIF_TARGET_PIXEL_WIDTH) continue;
+                if (gifActiveBuffer) { 
+                     gifActiveBuffer[sy_rel * GIF_TARGET_PIXEL_WIDTH + sx_rel] = color;
+                }
+            }
+        }
+    }
+}
+
+void * GIFOpenFileLFS(const char *fname, int32_t *pFileSize) {
+    if (!littleFSReady) {
+        *pFileSize = 0;
+        return NULL;
+    }
+    String corrected_fname = String(fname);
+    if (!corrected_fname.startsWith("/")) {
+        corrected_fname = "/" + corrected_fname;
+    }
+    gifFileHandle = LittleFS.open(corrected_fname.c_str(), "r");
+    if (!gifFileHandle) {
+        *pFileSize = 0;
+        return NULL;
+    }
+    *pFileSize = gifFileHandle.size();
+    return &gifFileHandle;
+}
+
+void GIFCloseFileLFS(void *pHandle) {
+    if (gifFileHandle && pHandle == &gifFileHandle) {
+        gifFileHandle.close();
+    }
+}
+
+int32_t GIFReadFileLFS(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
+    if (!littleFSReady || !pFile || !pFile->fHandle) return 0;
+    int32_t iBytesRead = 0;
+    File* f = (File*)pFile->fHandle;
+    if ((pFile->iPos + iLen) > pFile->iSize) {
+        iLen = pFile->iSize - pFile->iPos;
+    }
+    if (iLen <= 0) return 0;
+    iBytesRead = f->read(pBuf, iLen);
+    if (iBytesRead > 0) {
+      pFile->iPos += iBytesRead;
+    }
+    return iBytesRead;
+}
+
+int32_t GIFSeekFileLFS(GIFFILE *pFile, int32_t iPosition) {
+    if (!littleFSReady || !pFile || !pFile->fHandle) return -1;
+    File* f = (File*)pFile->fHandle;
+    if (iPosition >= pFile->iSize) { 
+        iPosition = pFile->iSize - 1;
+    }
+    if (f->seek(iPosition, SeekSet)) {
+        pFile->iPos = iPosition;
+        return iPosition;
+    }
+    return -1; 
+}
+
+
+// --- WiFi Manager Functions ---
+bool loadWiFiCredentials() {
+    if (!littleFSReady) return false;
+    if (LittleFS.exists(WIFI_SSID_PATH) && LittleFS.exists(WIFI_PASS_PATH)) {
+        File ssidFile = LittleFS.open(WIFI_SSID_PATH, "r");
+        File passFile = LittleFS.open(WIFI_PASS_PATH, "r");
+        if (ssidFile && passFile) {
+            wifi_ssid_stored = ssidFile.readStringUntil('\n');
+            wifi_password_stored = passFile.readStringUntil('\n');
+            wifi_ssid_stored.trim();
+            wifi_password_stored.trim();
+            ssidFile.close();
+            passFile.close();
+            if (wifi_ssid_stored.length() > 0) return true;
+        } else {
+            if (ssidFile) ssidFile.close();
+            if (passFile) passFile.close();
+        }
+    }
+    return false;
+}
+
+void saveWiFiCredentials(const String& ssid, const String& password) {
+    if (!littleFSReady) return;
+    File ssidFile = LittleFS.open(WIFI_SSID_PATH, "w");
+    if (ssidFile) { ssidFile.println(ssid); ssidFile.close(); } 
+    else { Serial.println("saveWiFiCredentials: LOI mo file SSID de ghi."); return; }
+
+    File passFile = LittleFS.open(WIFI_PASS_PATH, "w");
+    if (passFile) { passFile.println(password); passFile.close(); } 
+    else { Serial.println("saveWiFiCredentials: LOI mo file Password de ghi."); }
+    wifi_ssid_stored = ssid;
+    wifi_password_stored = password;
+}
+
+void deleteWiFiCredentials() {
+    if (!littleFSReady) return;
+    LittleFS.remove(WIFI_SSID_PATH);
+    LittleFS.remove(WIFI_PASS_PATH);
+    wifi_ssid_stored = "";
+    wifi_password_stored = "";
+}
+
+
+// --- WebServer Handlers ---
+void handleRoot() {
+    if (wifiManagerMode) { 
+        handleWifiConfigRoot();
+    } else { 
+        server.send_P(200, "text/html", index_html);
+    }
+}
+void handleWifiConfigRoot() { server.send_P(200, "text/html", wifi_config_html); }
+void handleSTAWifiSetupPage() { server.send_P(200, "text/html", wifi_config_html); }
+
+void handleWifiSave() {
+    String new_ssid = server.hasArg("ssid_manual") ? server.arg("ssid_manual") : "";
+    if (new_ssid.isEmpty() && server.hasArg("ssid_select")) {
+        new_ssid = server.arg("ssid_select");
+    }
+    String new_password = server.hasArg("password") ? server.arg("password") : "";
+
+    if (new_ssid.length() == 0) {
+        server.send(400, "text/plain", "SSID khong duoc de trong."); return;
+    }
+
+    gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextSize(2); gfx.setTextColor(COL_WHITE);
+    gfx.println("Dang luu cau hinh WiFi..."); gfx.printf("SSID: %s\n", new_ssid.c_str());
+    
+    saveWiFiCredentials(new_ssid, new_password);
+
+    gfx.println("Dang thu ket noi..."); 
+    WiFi.disconnect(true); WiFi.mode(WIFI_STA);
+    WiFi.begin(new_ssid.c_str(), new_password.c_str());
+
+    int ct = 0;
+    while (WiFi.status() != WL_CONNECTED && ct++ < 30) { 
+        delay(500); Serial.print("."); gfx.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        gfx.println("\nKet noi thanh cong!"); gfx.println("IP: " + WiFi.localIP().toString()); gfx.println("Se khoi dong lai...");
+        server.send(200, "text/html", "<h1>Da luu va ket noi WiFi thanh cong!</h1><p>Thiet bi se khoi dong lai sau vai giay.</p><script>setTimeout(function(){ window.location.href = '/'; }, 3000);</script>");
+        delay(3000); ESP.restart();
+    } else {
+        gfx.println("\nKet noi that bai!"); gfx.println("Kiem tra lai SSID/Pass.");
+        String tryAgainPath = wifiManagerMode ? "/" : "/wifisetup";
+        server.send(200, "text/html", "<h1>Ket noi WiFi that bai!</h1><p>Vui long kiem tra lai SSID va mat khau. <a href='" + tryAgainPath + "'>Thu lai tu trang cau hinh</a>.</p>");
+    }
+}
+
+void handleScanWifi() {
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    if (n > 0) {
+        std::vector<std::pair<int, int>> networks; 
+        for (int i = 0; i < n; ++i) {
+            networks.push_back({WiFi.RSSI(i), i});
+        }
+        std::sort(networks.rbegin(), networks.rend()); 
+
+        for (int i = 0; i < n; ++i) {
+            int originalIndex = networks[i].second;
+            if (i > 0) json += ",";
+            json += "{";
+            json += "\"ssid\":\"" + WiFi.SSID(originalIndex) + "\"";
+            json += ",\"rssi\":" + String(WiFi.RSSI(originalIndex));
+            json += ",\"secure\":" + String(WiFi.encryptionType(originalIndex) == WIFI_AUTH_OPEN ? "false" : "true");
+            json += "}";
+        }
+    }
+    WiFi.scanDelete(); 
+    json += "]";
+    server.send(200, "application/json", json);
+}
+
+void handleListFilesAPI() {
+    if (!littleFSReady) {
+        server.send(503, "text/plain", "File system not ready."); return;
+    }
+    String pathParam = server.hasArg("path") ? server.arg("path") : "/";
+    if (!pathParam.startsWith("/")) pathParam = "/" + pathParam; 
+    if (pathParam.indexOf("..") != -1) {
+        server.send(400, "text/plain", "Invalid path."); return;
+    }
+    if (!LittleFS.exists(pathParam)) {
+        server.send(404, "text/plain", "Directory not found: " + pathParam); return;
+    }
+    File root = LittleFS.open(pathParam);
+    if(!root.isDirectory()){
+        server.send(500, "text/plain", "Not a directory: " + pathParam);
+        root.close(); return;
+    }
+    String jsonResponse = "[";
+    File file = root.openNextFile();
+    bool firstFile = true;
+    while (file) {
+        if (!file.isDirectory()) { 
+            if (!firstFile) jsonResponse += ",";
+            firstFile = false;
+            String leafName = String(file.name()); 
+            String absolutePathForJson;
+            if (pathParam.endsWith("/")) absolutePathForJson = pathParam + leafName;
+            else {
+                if (pathParam == "/") absolutePathForJson = "/" + leafName;
+                else absolutePathForJson = pathParam + "/" + leafName;
+            }
+            absolutePathForJson.replace("//", "/");
+            String nameForDisplay = leafName; 
+            jsonResponse += "{\"name\":\"" + nameForDisplay + "\",";
+            jsonResponse += "\"path\":\"" + absolutePathForJson + "\"}"; 
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    jsonResponse += "]";
+    server.send(200, "application/json", jsonResponse);
+}
+
+void handleDeleteFileAPI() {
+    if (!littleFSReady) {
+        server.send(503, "text/plain", "File system not ready. Cannot delete."); return;
+    }
+    String filePathToDelete = "";
+    if (server.hasArg("path")) { 
+        filePathToDelete = server.arg("path");
+    } else {
+        server.send(400, "text/plain", "Thieu tham so 'path'"); return;
+    }
+    if (!filePathToDelete.startsWith("/") || filePathToDelete.indexOf("..") != -1) {
+        server.send(400, "text/plain", "Loi: Duong dan tep khong hop le. Path received: " + filePathToDelete); return;
+    }
+    if (filePathToDelete.startsWith("/anim/") && (filePathToDelete == currentAnimationPath || filePathToDelete == lastGifPlayed)) {
+        if (gifFileHandle && String(gifFileHandle.name()) == filePathToDelete) { 
+             gif.close(); 
+        } else {
+            gif.close();
+        }
+        delay(100); 
+        lastGifPlayed = ""; 
+        if (filePathToDelete == currentAnimationPath) currentAnimationPath = ""; 
+        needsGifBackgroundUpdate = true; 
+    }
+    if (LittleFS.exists(filePathToDelete)) {
+        bool deleteSuccess = LittleFS.remove(filePathToDelete);
+        if (deleteSuccess) {
+            server.send(200, "text/plain", "Da xoa tep thanh cong: " + filePathToDelete);
+            if (filePathToDelete.startsWith("/anim/")) scanAnimationFiles(); 
+            if (filePathToDelete == currentBackgroundImagePath) {
+                currentBackgroundImagePath = ""; 
+                lastImageChangeTime = 0; 
+                needsGifBackgroundUpdate = true; 
+            }
+        } else {
+            server.send(500, "text/plain", "Loi xoa tep tu server");
+        }
+    } else {
+        server.send(404, "text/plain", "Khong tim thay tep de xoa: " + filePathToDelete);
+    }
+}
+
+String uploadTargetDir = ""; 
+
+void handleUpload() {
+    HTTPUpload& upload = server.upload();
+    g_uploadErrorOccurred = false;
+    g_uploadWarningMessage = ""; 
+
+    if (upload.status == UPLOAD_FILE_START) {
+        if (!littleFSReady) {
+            g_uploadErrorOccurred = true;
+            g_uploadWarningMessage = "LOI: He thong file chua san sang!";
+            fsUploadFile = File(); return;
+        }
+        String filename = upload.filename;
+        if (filename.length() == 0) {
+            g_uploadErrorOccurred = true;
+            fsUploadFile = File(); return;
+        }
+        if (!filename.startsWith("/")) filename = "/" + filename;
+
+        String requestUri = server.uri();
+        if (requestUri.equalsIgnoreCase("/upload-image")) uploadTargetDir = "/img";
+        else if (requestUri.equalsIgnoreCase("/upload-anim")) uploadTargetDir = "/anim";
+        else {
+            g_uploadErrorOccurred = true;
+            fsUploadFile = File(); return;
+        }
+        if (!LittleFS.exists(uploadTargetDir)) {
+            if (!LittleFS.mkdir(uploadTargetDir)) {
+                g_uploadErrorOccurred = true;
+                fsUploadFile = File(); return;
+            }
+        }
+        size_t totalBytes = LittleFS.totalBytes();
+        size_t usedBytes = LittleFS.usedBytes();
+        size_t freeBytes = totalBytes - usedBytes;
+        size_t fileSize = upload.totalSize;
+
+        if (fileSize > freeBytes) {
+            g_uploadErrorOccurred = true;
+            g_uploadWarningMessage = "LOI: Khong du bo nho!"; 
+            fsUploadFile = File(); return; 
+        } else if ((freeBytes - fileSize) < LOW_MEMORY_THRESHOLD) {
+            g_uploadWarningMessage = "CANH BAO: Bo nho sap day!";
+        }
+        String filePath = uploadTargetDir + filename;
+        filePath.replace("../", ""); 
+        filePath.replace("//", "/");
+        fsUploadFile = LittleFS.open(filePath, "w");
+        if (!fsUploadFile) g_uploadErrorOccurred = true;
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (fsUploadFile) {
+            size_t bytesWritten = fsUploadFile.write(upload.buf, upload.currentSize);
+            if (bytesWritten != upload.currentSize) {
+                g_uploadErrorOccurred = true;
+                fsUploadFile.close(); 
+                fsUploadFile = File(); 
+            }
+        } else if (!g_uploadErrorOccurred) { 
+            g_uploadErrorOccurred = true;
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (fsUploadFile) {
+            String filePath = fsUploadFile.name(); 
+            fsUploadFile.close();
+            if (!g_uploadErrorOccurred) {
+                if (filePath.startsWith("/anim/")) {
+                    if (filePath == lastGifPlayed) lastGifPlayed = ""; 
+                    scanAnimationFiles(); 
+                    needsGifBackgroundUpdate = true; 
+                } else if (filePath.startsWith("/img/")) {
+                    if (filePath == currentBackgroundImagePath || currentBackgroundImagePath.isEmpty()) {
+                        currentBackgroundImagePath = filePath; 
+                        lastImageChangeTime = 0; 
+                        needsGifBackgroundUpdate = true;
+                    }
+                }
+            } else { 
+                LittleFS.remove(filePath); 
+            }
+        } else { 
+        }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        g_uploadErrorOccurred = true;
+        if (fsUploadFile) fsUploadFile.close(); 
+    }
+}
+
+void handleUploadFinal(String successMessage) {
+    String responseMessage = successMessage;
+    int httpCode = 200;
+
+    if (g_uploadErrorOccurred) {
+        if (g_uploadWarningMessage.startsWith("LOI:")) { 
+             responseMessage = g_uploadWarningMessage;
+        } else {
+            responseMessage = "Loi ghi file len server.";
+        }
+        httpCode = 500; 
+    } else if (server.upload().filename.length() == 0) {
+        responseMessage = "Loi: Khong co ten file.";
+        httpCode = 400; 
+    } else if (server.upload().totalSize == 0 && server.upload().filename.length() > 0) {
+        String filename = server.upload().filename;
+        if (!filename.startsWith("/")) filename = "/" + filename;
+        String filePath = uploadTargetDir + filename;
+        filePath.replace("//","/");
+        LittleFS.remove(filePath); 
+        responseMessage = "Loi: File trong hoac khong co du lieu.";
+        httpCode = 400; 
+    }
+    else if (!g_uploadWarningMessage.isEmpty() && !g_uploadWarningMessage.startsWith("LOI:")) {
+        server.sendHeader("X-Upload-Warning", g_uploadWarningMessage);
+    }
+    server.send(httpCode, "text/plain", responseMessage);
+    g_uploadErrorOccurred = false;
+    g_uploadWarningMessage = "";
+    uploadTargetDir = ""; 
+}
+
+void handleReboot() {
+    server.send(200, "text/plain", "Khoi dong lai thiet bi...");
+    delay(1000);
+    ESP.restart();
+}
+
+void handleNotFound() {
+    String message = "File Not Found\n\n";
+    message += "URI: "; message += server.uri();
+    message += "\nMethod: "; message += (server.method() == HTTP_GET) ? "GET" : "POST";
+    message += "\nArguments: "; message += server.args();
+    message += "\n";
+    for (uint8_t i = 0; i < server.args(); i++) {
+        message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+    }
+    server.send(404, "text/plain", message);
+}
+
+void handleGetWeatherConfig() {
+    String response = "{";
+    response += "\"apikey\":\"" + openWeatherMapApiKey + "\",";
+    response += "\"city\":\"" + city + "\",";
+    response += "\"countrycode\":\"" + countryCode + "\"";
+    response += "}";
+    server.send(200, "application/json", response);
+}
+
+void handleSaveWeatherConfig() {
+    bool changed = false;
+    if (server.hasArg("apikey")) {
+        String newApiKey = server.arg("apikey");
+        if (newApiKey.length() > 0 && newApiKey != openWeatherMapApiKey) {
+            openWeatherMapApiKey = newApiKey; changed = true;
+        }
+    }
+    if (server.hasArg("city")) {
+        String newCity = server.arg("city");
+         if (newCity.length() > 0 && newCity != city) {
+            city = newCity; changed = true;
+        }
+    }
+    if (server.hasArg("countrycode")) {
+        String newCountryCode = server.arg("countrycode");
+        if (newCountryCode.length() > 0 && newCountryCode != countryCode) {
+            countryCode = newCountryCode; changed = true;
+        }
+    }
+    if (changed) {
+        if (!littleFSReady) {
+            server.send(503, "text/plain", "File system not ready. Cannot save weather config."); return;
+        }
+        DynamicJsonDocument doc(256); 
+        doc["apikey"] = openWeatherMapApiKey;
+        doc["city"] = city;
+        doc["countrycode"] = countryCode;
+        File configFile = LittleFS.open(WEATHER_CONFIG_PATH, "w");
+        if (!configFile) {
+            server.send(500, "text/plain", "Lỗi lưu cấu hình (mở file)"); return;
+        }
+        if (serializeJson(doc, configFile) == 0) {
+            server.send(500, "text/plain", "Lỗi ghi cấu hình (ghi file)");
+        } else {
+            server.send(200, "text/plain", "Đã lưu cấu hình thời tiết!");
+            lastWeatherUpdateTime = 0; 
+        }
+        configFile.close();
+    } else {
+        server.send(200, "text/plain", "Không có thay đổi nào để lưu.");
+    }
+}
+
+void loadWeatherConfig() {
+    if (!littleFSReady) return;
+    if (LittleFS.exists(WEATHER_CONFIG_PATH)) {
+        File configFile = LittleFS.open(WEATHER_CONFIG_PATH, "r");
+        if (configFile) {
+            DynamicJsonDocument doc(256);
+            DeserializationError error = deserializeJson(doc, configFile);
+            if (!error) {
+                openWeatherMapApiKey = doc["apikey"] | openWeatherMapApiKey;
+                city = doc["city"] | city;
+                countryCode = doc["countrycode"] | countryCode;
+            }
+            configFile.close();
+        }
+    }
+}
+
+// --- Telegram & WOL Config Handlers ---
+void loadTelegramConfig() {
+    if (!littleFSReady) {
+        Serial.println("loadTelegramConfig: LittleFS not ready.");
+        return;
+    }
+    Serial.println("loadTelegramConfig: Attempting to load Telegram/WOL config...");
+    wolDeviceList.clear(); 
+
+    if (LittleFS.exists(TELEGRAM_CONFIG_PATH)) {
+        File configFile = LittleFS.open(TELEGRAM_CONFIG_PATH, "r");
+        if (configFile) {
+            DynamicJsonDocument doc(1024); // Tăng kích thước nếu cần cho nhiều thiết bị WOL
+            DeserializationError error = deserializeJson(doc, configFile);
+            if (error) {
+                Serial.print("loadTelegramConfig: Error deserializing JSON: ");
+                Serial.println(error.c_str());
+            } else {
+                authorizedTelegramChatId = doc["chat_id"] | "";
+                JsonArray devices = doc["wol_devices"].as<JsonArray>();
+                for (JsonObject device : devices) {
+                    WolDevice wd;
+                    wd.name = device["name"].as<String>();
+                    wd.mac = device["mac"].as<String>();
+                    if (wd.name.length() > 0 && wd.mac.length() > 0) {
+                        wolDeviceList.push_back(wd);
+                    }
+                }
+                Serial.println("Da load cau hinh Telegram/WOL tu file.");
+                Serial.println("Authorized Chat ID: " + authorizedTelegramChatId);
+                Serial.printf("%d WOL devices loaded.\n", wolDeviceList.size());
+            }
+            configFile.close();
+        } else {
+            Serial.println("loadTelegramConfig: Khong the mo file " + String(TELEGRAM_CONFIG_PATH));
+        }
+    } else {
+        Serial.println("loadTelegramConfig: File " + String(TELEGRAM_CONFIG_PATH) + " khong ton tai. Su dung gia tri mac dinh.");
+    }
+}
+
+void handleGetTelegramConfig() {
+    DynamicJsonDocument doc(1024); // Phải đủ lớn để chứa dữ liệu
+    doc["chat_id"] = authorizedTelegramChatId;
+    JsonArray devices = doc.createNestedArray("wol_devices");
+    for (const auto& dev : wolDeviceList) {
+        JsonObject d = devices.createNestedObject();
+        d["name"] = dev.name;
+        d["mac"] = dev.mac;
+    }
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+void handleSaveTelegramConfig() {
+    if (!littleFSReady) {
+        server.send(503, "text/plain", "File system not ready.");
+        return;
+    }
+    bool changed = false;
+    String newChatId = server.hasArg("chatid") ? server.arg("chatid") : "";
+    String wolDevicesStr = server.hasArg("woldevices") ? server.arg("woldevices") : "";
+
+    if (newChatId != authorizedTelegramChatId) {
+        authorizedTelegramChatId = newChatId;
+        changed = true;
+    }
+
+    // Parse wolDevicesStr (Name=MAC, one per line)
+    std::vector<WolDevice> newWolDeviceList;
+    int currentPos = 0;
+    while (currentPos < wolDevicesStr.length()) {
+        int nextNewline = wolDevicesStr.indexOf('\n', currentPos);
+        if (nextNewline == -1) nextNewline = wolDevicesStr.length();
+        String line = wolDevicesStr.substring(currentPos, nextNewline);
+        line.trim();
+        currentPos = nextNewline + 1;
+
+        if (line.length() > 0) {
+            int separatorPos = line.indexOf('=');
+            if (separatorPos > 0 && separatorPos < line.length() - 1) {
+                WolDevice wd;
+                wd.name = line.substring(0, separatorPos);
+                wd.mac = line.substring(separatorPos + 1);
+                wd.name.trim();
+                wd.mac.trim();
+                // Thêm một số kiểm tra cơ bản cho MAC
+                uint8_t tempMac[6];
+                if (wd.name.length() > 0 && wd.mac.length() >= 17 && parseMacAddress(wd.mac, tempMac)) { // MAC hợp lệ có dạng XX:XX:XX:XX:XX:XX
+                    newWolDeviceList.push_back(wd);
+                } else {
+                     Serial.println("Bo qua dong WOL khong hop le: " + line);
+                }
+            } else {
+                 Serial.println("Bo qua dong WOL khong hop le (thieu '='): " + line);
+            }
+        }
+    }
+    
+    // So sánh danh sách thiết bị cũ và mới để xác định thay đổi
+    if (newWolDeviceList.size() != wolDeviceList.size()) {
+        changed = true;
+    } else {
+        for (size_t i = 0; i < newWolDeviceList.size(); ++i) {
+            if (newWolDeviceList[i].name != wolDeviceList[i].name || newWolDeviceList[i].mac != wolDeviceList[i].mac) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    
+    if (changed) {
+        wolDeviceList = newWolDeviceList; // Cập nhật danh sách trong bộ nhớ
+
+        DynamicJsonDocument doc(1024); // Tăng nếu cần
+        doc["chat_id"] = authorizedTelegramChatId;
+        JsonArray devices = doc.createNestedArray("wol_devices");
+        for (const auto& dev : wolDeviceList) {
+            JsonObject d = devices.createNestedObject();
+            d["name"] = dev.name;
+            d["mac"] = dev.mac;
+        }
+
+        File configFile = LittleFS.open(TELEGRAM_CONFIG_PATH, "w");
+        if (!configFile) {
+            Serial.println("Loi mo file " + String(TELEGRAM_CONFIG_PATH) + " de ghi");
+            server.send(500, "text/plain", "Loi luu cau hinh (mo file)");
+            return;
+        }
+        if (serializeJson(doc, configFile) == 0) {
+            Serial.println("Loi ghi vao file " + String(TELEGRAM_CONFIG_PATH));
+            server.send(500, "text/plain", "Loi ghi cau hinh (ghi file)");
+        } else {
+            Serial.println("Da luu cau hinh Telegram/WOL vao " + String(TELEGRAM_CONFIG_PATH));
+            server.send(200, "text/plain", "Da luu cau hinh Telegram & WOL!");
+        }
+        configFile.close();
+    } else {
+        server.send(200, "text/plain", "Khong co thay doi nao de luu.");
+    }
+}
+
+
+void handleGetCurrentSsid() {
+    if (WiFi.status() == WL_CONNECTED) server.send(200, "text/plain", WiFi.SSID());
+    else server.send(200, "text/plain", "Khong ket noi");
+}
+
+void handleStorageInfo() {
+    if (!littleFSReady) {
+        server.send(503, "application/json", "{\"error\":\"File system not ready\"}"); return;
+    }
+    size_t totalBytes = LittleFS.totalBytes();
+    size_t usedBytes = LittleFS.usedBytes();
+    size_t freeBytes = totalBytes - usedBytes;
+    bool lowMemoryWarning = (freeBytes < LOW_MEMORY_THRESHOLD);
+
+    String jsonResponse = "{";
+    jsonResponse += "\"total\":" + String(totalBytes) + ",";
+    jsonResponse += "\"used\":" + String(usedBytes) + ",";
+    jsonResponse += "\"free\":" + String(freeBytes) + ",";
+    jsonResponse += "\"low_memory_warning\":" + String(lowMemoryWarning ? "true" : "false");
+    jsonResponse += "}";
+    server.send(200, "application/json", jsonResponse);
+}
+
+// --- Brightness Control Functions ---
+void setBacklightBrightness(uint8_t brightness) {
+    currentBrightness = brightness;
+    analogWrite(TFT_BL, currentBrightness); 
+}
+
+void saveBrightnessSetting(uint8_t brightness) {
+    if (!littleFSReady) return;
+    File file = LittleFS.open(BRIGHTNESS_CONFIG_PATH, "w");
+    if (file) { file.print(brightness); file.close(); } 
+}
+
+void loadBrightnessSetting() {
+    uint8_t loadedBrightness = 255; 
+    if (littleFSReady && LittleFS.exists(BRIGHTNESS_CONFIG_PATH)) {
+        File file = LittleFS.open(BRIGHTNESS_CONFIG_PATH, "r");
+        if (file && file.available()) loadedBrightness = file.readStringUntil('\n').toInt();
+        if(file) file.close();
+    }
+    setBacklightBrightness(loadedBrightness); 
+}
+
+void handleSetBrightness() {
+    if (server.hasArg("value")) {
+        int val = server.arg("value").toInt();
+        if (val < 0) val = 0;
+        if (val > 255) val = 255; 
+        setBacklightBrightness(static_cast<uint8_t>(val));
+        saveBrightnessSetting(currentBrightness);
+        server.send(200, "text/plain", "Đã cập nhật độ sáng thành " + String((currentBrightness * 100) / 255) + "%");
+    } else {
+        server.send(400, "text/plain", "Thiếu tham số 'value'");
+    }
+}
+
+void handleGetBrightness() {
+    String response = "{\"brightness\":" + String(currentBrightness) + "}";
+    server.send(200, "application/json", response);
+}
+
+void handleDeleteWifi() {
+    deleteWiFiCredentials(); 
+    String responseMessage = "Da xoa thong tin WiFi. Thiet bi se khoi dong lai o che do AP sau khoang 3 giay.";
+    server.send(200, "text/plain", responseMessage);
+    gfx.fillScreen(COL_BLACK);
+    gfx.setCursor(10, 10); gfx.setTextColor(COL_YELLOW); gfx.setTextSize(2);
+    gfx.println("Da xoa WiFi!");
+    gfx.setTextSize(1); gfx.setCursor(10, 50); gfx.println("Khoi dong lai sau 3s...");
+    gfx.setCursor(10, 70); gfx.println("Vui long doi..."); 
+    unsigned long rebootDelayStart = millis();
+    while (millis() - rebootDelayStart < 3000) { 
+        server.handleClient(); 
+        delay(50);             
+    }
+    ESP.restart(); 
+}
+
+void startAPMode() {
+    wifiManagerMode = true; 
+    gfx.fillScreen(COL_BLACK);
+    gfx.setCursor(10,10); gfx.setTextSize(2); gfx.setTextColor(COL_WHITE);
+    gfx.println("CHE DO CAU HINH WIFI");
+    WiFi.disconnect(true); 
+    WiFi.mode(WIFI_AP);    
+    delay(100);            
+    if (AP_PASSWORD != NULL && strlen(AP_PASSWORD) >= 8) WiFi.softAP(AP_SSID, AP_PASSWORD);
+    else WiFi.softAP(AP_SSID); 
+    delay(500); 
+    IPAddress apIP = WiFi.softAPIP();
+    gfx.setCursor(10, 50); gfx.setTextColor(COL_WHITE);
+    gfx.println("Mo WiFi:"); gfx.setCursor(10, 70); gfx.println(AP_SSID);
+    gfx.setCursor(10, 100); gfx.println("Truy cap IP:"); gfx.setCursor(10, 120); gfx.println(apIP.toString());
+    server.on("/", HTTP_GET, handleWifiConfigRoot);   
+    server.on("/wifisave", HTTP_POST, handleWifiSave);   
+    server.on("/scanwifi", HTTP_GET, handleScanWifi);    
+    server.onNotFound(handleWifiConfigRoot); 
+    server.begin();
+}
+
+void startSTAModeAndMainApp() {
+    wifiManagerMode = false; 
+    if (littleFSReady) {
+        loadWeatherConfig();
+        loadTelegramConfig(); // Tải cấu hình Telegram/WOL
+        loadBrightnessSetting(); 
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi connected. Configuring time and Telegram bot client...");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServerPrimary, ntpServerSecondary);
+        
+        // Cấu hình clientSecure cho Telegram Bot SAU KHI WiFi đã kết nối
+        Serial.println("Setting up WiFiClientSecure for Telegram...");
+        clientSecure.setInsecure(); // Bỏ qua kiểm tra certificate cho mục đích gỡ lỗi
+                                    // CÂN NHẮC: Đối với production, nên sử dụng setCACert() với chứng chỉ gốc của Telegram
+        Serial.println("WiFiClientSecure set to insecure mode for Telegram.");
+
+    } else {
+        Serial.println("WiFi not connected. Skipping time and Telegram bot client setup.");
+    }
+
+    server.on("/", HTTP_GET, handleRoot); 
+    server.on("/list-files", HTTP_GET, handleListFilesAPI);
+    server.on("/delete-file", HTTP_POST, handleDeleteFileAPI);
+    server.on("/reboot", HTTP_POST, handleReboot);
+    server.on("/getweatherconfig", HTTP_GET, handleGetWeatherConfig);
+    server.on("/saveweatherconfig", HTTP_POST, handleSaveWeatherConfig);
+    server.on("/gettelegramconfig", HTTP_GET, handleGetTelegramConfig); // API lấy config Telegram
+    server.on("/savetelegramconfig", HTTP_POST, handleSaveTelegramConfig); // API lưu config Telegram
+    server.on("/getcurrentssid", HTTP_GET, handleGetCurrentSsid);
+    server.on("/storageinfo", HTTP_GET, handleStorageInfo);
+    server.on("/set-brightness", HTTP_POST, handleSetBrightness);
+    server.on("/get-brightness", HTTP_GET, handleGetBrightness);
+    server.on("/deletewifi", HTTP_POST, handleDeleteWifi); 
+    server.on("/wifisetup", HTTP_GET, handleSTAWifiSetupPage); 
+    server.on("/wifisave", HTTP_POST, handleWifiSave);         
+    server.on("/scanwifi", HTTP_GET, handleScanWifi);          
+    server.on("/upload-image", HTTP_POST, [](){ handleUploadFinal("Tai anh len thanh cong!"); }, handleUpload);
+    server.on("/upload-anim", HTTP_POST, [](){ handleUploadFinal("Tai hoat anh GIF thanh cong!"); }, handleUpload);
+    server.onNotFound(handleNotFound);
+    server.begin();
+
+    TJpgDec.setJpgScale(1); 
+    TJpgDec.setSwapBytes(false); 
+    TJpgDec.setCallback(tft_output_callback_jpeg); 
+    gif.begin(GIF_PALETTE_RGB565_LE); 
+    if (littleFSReady) scanAnimationFiles();
+    if (WiFi.status() == WL_CONNECTED && (lastWeatherUpdateTime == 0 || currentWeatherIconCode == "unknown")) {
+        fetchWeatherData();
+        lastWeatherUpdateTime = millis();
+    }
+    if (littleFSReady) {
+        displayRandomBackgroundImage(); 
+        lastImageChangeTime = millis();
+        if (needsGifBackgroundUpdate && gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+            captureAndStoreGifBackground();
+        }
+    } else {
+        gfx.fillScreen(COL_BLACK);
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 - 20); gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+        gfx.println("LOI HE THONG FILE!");
+        gfx.setTextSize(1); gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 + 10);
+        gfx.println("Khong the doc/ghi file.");
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    unsigned long setupStartTime = millis();
+    while (!Serial && (millis() - setupStartTime < 2000)); 
+    if (!gfx.begin()) { while (1) delay(100); }
+    SCREEN_WIDTH_VAL = gfx.width();
+    SCREEN_HEIGHT_VAL = gfx.height();
+    COL_BLACK = gfx.color565(0,0,0); COL_WHITE = gfx.color565(255,255,255);
+    COL_RED = gfx.color565(255,0,0); COL_GREEN = gfx.color565(0,255,0);
+    COL_BLUE = gfx.color565(0,0,255); COL_YELLOW = gfx.color565(255,255,0);
+    COL_DARKGREY = gfx.color565(64,64,64); COL_LIGHTGREY = gfx.color565(192,192,192);
+    COL_CYAN = gfx.color565(0,255,255);
+    gfx.fillScreen(COL_RED); 
+    gfx.setCursor(10, 10); gfx.setTextColor(COL_WHITE, COL_RED); gfx.setTextSize(2);
+    gfx.println("GFX OK"); delay(1000);
+    gfx.fillScreen(COL_BLACK); gfx.setCursor(10, 10); gfx.setTextColor(COL_WHITE); gfx.setTextSize(1);
+    gfx.println("Dang khoi dong...");
+
+    GIF_TARGET_PIXEL_HEIGHT = roundf((GIF_TARGET_HEIGHT_CM / INCH_TO_CM) * DISPLAY_DPI); 
+    GIF_TARGET_PIXEL_WIDTH = roundf((GIF_TARGET_WIDTH_CM / INCH_TO_CM) * DISPLAY_DPI);   
+    GIF_AREA_X = SCREEN_WIDTH_VAL - GIF_TARGET_PIXEL_WIDTH - GIF_MARGIN;
+    GIF_AREA_Y = SCREEN_HEIGHT_VAL - OVERLAY_HEIGHT - GIF_TARGET_PIXEL_HEIGHT - GIF_MARGIN;
+    if (GIF_AREA_Y < 0) GIF_AREA_Y = 0; 
+
+    size_t bufferSizeBytes = (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT * sizeof(uint16_t);
+    if (psramFound()) {
+        gifBackgroundBuffer = (uint16_t*)ps_malloc(bufferSizeBytes);
+        gifActiveBuffer = (uint16_t*)ps_malloc(bufferSizeBytes);
+    } else {
+        gifBackgroundBuffer = (uint16_t*)malloc(bufferSizeBytes);
+        gifActiveBuffer = (uint16_t*)malloc(bufferSizeBytes);
+    }
+    if (!gifBackgroundBuffer || !gifActiveBuffer) {
+        if(gifBackgroundBuffer) { free(gifBackgroundBuffer); gifBackgroundBuffer = nullptr; }
+        if(gifActiveBuffer) { free(gifActiveBuffer); gifActiveBuffer = nullptr; }
+    } else {
+        for(size_t i = 0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) {
+            if (gifBackgroundBuffer) gifBackgroundBuffer[i] = COL_BLACK;
+            if (gifActiveBuffer) gifActiveBuffer[i] = COL_BLACK;
+        }
+    }
+    if (TFT_BL != -1) { /* Pin BL được cấu hình */ }
+
+    if (!LittleFS.begin(false)) { 
+        gfx.setCursor(10, 30); gfx.setTextColor(COL_RED); gfx.println("Loi LittleFS!");
+        gfx.println("Dang format...");
+        if (LittleFS.format()) {
+            if (!LittleFS.begin(false)) { 
+                 gfx.println("Format loi! Check FS."); littleFSReady = false; 
+            } else { littleFSReady = true; }
+        } else {
+            gfx.println("Format FS loi!"); littleFSReady = false; 
+        }
+    } else { littleFSReady = true; }
+
+    if (littleFSReady) {
+        if (!LittleFS.exists("/img")) LittleFS.mkdir("/img");
+        if (!LittleFS.exists("/anim")) LittleFS.mkdir("/anim");
+        if (!LittleFS.exists("/icon")) LittleFS.mkdir("/icon"); 
+        loadBrightnessSetting();
+    } else {
+        gfx.fillScreen(COL_BLACK);
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 - 20); gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+        gfx.println("LOI HE THONG FILE!");
+        gfx.setTextSize(1); gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 + 10);
+        gfx.println("Khong the doc/ghi file.");
+        if (TFT_BL != -1) setBacklightBrightness(255); 
+    }
+    
+    // Không cần clientSecure.setInsecure() ở đây nữa vì nó sẽ được gọi trong startSTAModeAndMainApp()
+    // sau khi WiFi kết nối.
+
+    gfx.setCursor(10, 50); gfx.setTextColor(COL_WHITE); gfx.setTextSize(1); 
+    gfx.print("Kiem tra WiFi...");
+    if (loadWiFiCredentials()) { 
+        gfx.setCursor(10, 70); gfx.setTextColor(COL_WHITE);
+        gfx.println("Ket noi WiFi..."); gfx.print(wifi_ssid_stored);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(wifi_ssid_stored.c_str(), wifi_password_stored.c_str());
+        int connect_timeout = 20; 
+        while (WiFi.status() != WL_CONNECTED && connect_timeout-- > 0) {
+            delay(500); Serial.print("."); gfx.print(".");
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextColor(COL_GREEN); gfx.setTextSize(2);
+            gfx.println("WiFi Da Ket Noi!"); gfx.setTextSize(1); gfx.println(WiFi.localIP().toString());
+            delay(2000);
+            startSTAModeAndMainApp();
+        } else {
+            gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+            gfx.println("Ket noi WiFi loi!"); delay(2000);
+            startAPMode();
+        }
+    } else {
+        gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextColor(COL_YELLOW); gfx.setTextSize(2);
+        gfx.println("Chua cau hinh WiFi!"); delay(2000);
+        startAPMode();
+    }
+}
+
+// --- loop ---
+void loop() {
+    server.handleClient(); 
+
+    if (wifiManagerMode) {
+        gfx.setCursor(SCREEN_WIDTH_VAL - 80, 5); gfx.setTextSize(1);
+        gfx.setTextColor(COL_YELLOW); gfx.print("AP MODE ");
+        static bool blink_ap = false;
+        gfx.setTextColor(blink_ap ? COL_YELLOW : COL_BLACK); 
+        gfx.print("."); blink_ap = !blink_ap;
+        delay(500); 
+        return; 
+    }
+    if (!littleFSReady) { delay(1000); return; }
+
+    // Xử lý Telegram Bot
+    if (WiFi.status() == WL_CONNECTED && millis() > bot_last_time + BOT_MTBS) {
+        // Serial.println("Loop: Calling handleTelegramBot()"); // Log trước khi gọi
+        handleTelegramBot();
+        bot_last_time = millis();
+    }
+
+
+    unsigned long currentTime = millis();
+    bool forceOverlayRedrawDueToBackgroundChange = false;
+
+    if (currentTime - lastImageChangeTime > imageChangeInterval || currentBackgroundImagePath.isEmpty()) {
+        displayRandomBackgroundImage(); 
+        lastImageChangeTime = currentTime;
+        forceOverlayRedrawDueToBackgroundChange = true; 
+        if (!currentBackgroundImagePath.isEmpty()) { 
+            needsGifBackgroundUpdate = true;
+        }
+        scanAnimationFiles(); 
+        lastGifPlayed = "";   
+    }
+    if (needsGifBackgroundUpdate && gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+        captureAndStoreGifBackground(); 
+    }
+    bool weatherNeedsUpdate = false;
+    if (WiFi.status() == WL_CONNECTED &&
+        (currentTime - lastWeatherUpdateTime > weatherUpdateInterval ||
+         (lastWeatherUpdateTime == 0 && currentWeatherIconCode == "unknown" && millis() > 15000L) || 
+         currentTemperature == -999.0f )) { 
+        fetchWeatherData();
+        lastWeatherUpdateTime = currentTime;
+        weatherNeedsUpdate = true;
+    }
+    struct tm timeinfo;
+    bool timeIsValid = getLocalTime(&timeinfo, 0); 
+    bool clockNeedsUpdate = false;
+    if (timeIsValid) {
+        if (timeinfo.tm_min != lastMinuteDisplayed) clockNeedsUpdate = true;
+    }
+    bool shouldRedrawOverlay = forceOverlayRedrawDueToBackgroundChange || weatherNeedsUpdate || clockNeedsUpdate;
+    if (shouldRedrawOverlay) {
+        if (!forceOverlayRedrawDueToBackgroundChange && !currentBackgroundImagePath.isEmpty()) {
+            drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+        }
+        drawClockDisplay(&timeinfo, timeIsValid);
+        drawWeatherInfo();
+        if (timeIsValid && clockNeedsUpdate) lastMinuteDisplayed = timeinfo.tm_min;
+        lastOverlayRedrawTime = currentTime;
+    } else if (currentTime - lastOverlayRedrawTime > 60000L && !currentBackgroundImagePath.isEmpty()) {
+        drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+        bool freshTimeIsValid = getLocalTime(&timeinfo, 0); 
+        drawClockDisplay(&timeinfo, freshTimeIsValid);
+        drawWeatherInfo();
+        lastOverlayRedrawTime = currentTime;
+        if (currentBackgroundImagePath != lastCapturedBackgroundImagePath && !currentBackgroundImagePath.isEmpty()){
+            needsGifBackgroundUpdate = true;
+        }
+    }
+    drawAnimation();
+    delay(50); 
+}
+
+// --- Drawing and Utility Functions ---
+void drawTextWithOutline(const String& text, int16_t x, int16_t y, uint16_t fgColor, uint16_t outlineColor, uint8_t textSize) {
+    gfx.setTextSize(textSize);
+    gfx.setTextColor(outlineColor); 
+    gfx.setCursor(x - 1, y); gfx.print(text);
+    gfx.setCursor(x + 1, y); gfx.print(text);
+    gfx.setCursor(x, y - 1); gfx.print(text);
+    gfx.setCursor(x, y + 1); gfx.print(text);
+    gfx.setTextColor(fgColor); 
+    gfx.setCursor(x, y); gfx.print(text);
+}
+
+bool tft_output_callback_jpeg(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (y >= SCREEN_HEIGHT_VAL) return false; 
+    gfx.draw16bitRGBBitmap(x, y, bitmap, w, h);
+    return true; 
+}
+
+bool tft_output_to_gif_background_buffer_callback(int16_t x_on_original_image, int16_t y_on_original_image, uint16_t block_width, uint16_t block_height, uint16_t* bitmap_data) {
+    if (!g_isCapturingForGifBackgroundBuffer || !gifBackgroundBuffer) return true; 
+    int16_t src_block_x1 = x_on_original_image; int16_t src_block_y1 = y_on_original_image;
+    int16_t src_block_x2 = x_on_original_image + block_width - 1; int16_t src_block_y2 = y_on_original_image + block_height - 1;
+    int16_t target_capture_x1 = g_captureSourceImgX; int16_t target_capture_y1 = g_captureSourceImgY;
+    int16_t target_capture_x2 = g_captureSourceImgX + g_captureSourceWidth - 1; int16_t target_capture_y2 = g_captureSourceImgY + g_captureSourceHeight - 1;
+    int16_t common_x1 = max(src_block_x1, target_capture_x1); int16_t common_y1 = max(src_block_y1, target_capture_y1);
+    int16_t common_x2 = min(src_block_x2, target_capture_x2); int16_t common_y2 = min(src_block_y2, target_capture_y2);
+    if (common_x1 > common_x2 || common_y1 > common_y2) return true; 
+    int16_t copy_width = common_x2 - common_x1 + 1; int16_t copy_height = common_y2 - common_y1 + 1;
+    int16_t src_start_x_in_block = common_x1 - src_block_x1; int16_t src_start_y_in_block = common_y1 - src_block_y1;
+    int16_t dest_start_x_in_buffer = common_x1 - g_captureSourceImgX; int16_t dest_start_y_in_buffer = common_y1 - g_captureSourceImgY;
+    for (int16_t yi = 0; yi < copy_height; ++yi) {
+        if ((dest_start_y_in_buffer + yi) >= g_captureSourceHeight) continue;
+        uint16_t* pSrc = bitmap_data + (src_start_y_in_block + yi) * block_width + src_start_x_in_block;
+        uint16_t* pDest = gifBackgroundBuffer + (dest_start_y_in_buffer + yi) * g_captureSourceWidth + dest_start_x_in_buffer;
+        int16_t actual_copy_width = copy_width;
+        if ((dest_start_x_in_buffer + copy_width) > g_captureSourceWidth) actual_copy_width = g_captureSourceWidth - dest_start_x_in_buffer;
+        if(actual_copy_width <=0) continue; 
+        memcpy(pDest, pSrc, actual_copy_width * sizeof(uint16_t));
+    }
+    return true; 
+}
+
+void captureAndStoreGifBackground() {
+    if (!gifBackgroundBuffer) { needsGifBackgroundUpdate = true; return; }
+    if (currentBackgroundImagePath.isEmpty() || !littleFSReady) {
+        for(size_t i = 0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) gifBackgroundBuffer[i] = COL_BLACK;
+        needsGifBackgroundUpdate = false; 
+        lastCapturedBackgroundImagePath = currentBackgroundImagePath; 
+        return;
+    }
+    if (!LittleFS.exists(currentBackgroundImagePath)) {
+        for(size_t i = 0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) gifBackgroundBuffer[i] = COL_BLACK;
+        needsGifBackgroundUpdate = false; 
+        lastCapturedBackgroundImagePath = currentBackgroundImagePath; 
+        return;
+    }
+    File jpegFile = LittleFS.open(currentBackgroundImagePath, "r");
+    if (!jpegFile) return;
+    g_isCapturingForGifBackgroundBuffer = true;
+    g_captureSourceImgX = GIF_AREA_X; g_captureSourceImgY = GIF_AREA_Y;
+    g_captureSourceWidth = GIF_TARGET_PIXEL_WIDTH; g_captureSourceHeight = GIF_TARGET_PIXEL_HEIGHT;
+    TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(false); 
+    TJpgDec.setCallback(tft_output_to_gif_background_buffer_callback); 
+    TJpgDec.drawFsJpg(0, 0, jpegFile);
+    jpegFile.close();
+    TJpgDec.setCallback(tft_output_callback_jpeg); 
+    g_isCapturingForGifBackgroundBuffer = false;
+    needsGifBackgroundUpdate = false; 
+    lastCapturedBackgroundImagePath = currentBackgroundImagePath;
+}
+
+void drawFsImage(const String& path, int x_pos, int y_pos, int w_max /*=0*/, int h_max /*=0*/) {
+    if (!littleFSReady) return; 
+    if (path.isEmpty() || !path.startsWith("/")) {
+        gfx.setCursor(x_pos > 0 ? x_pos : 10, y_pos > 0 ? y_pos : SCREEN_HEIGHT_VAL / 2 );
+        gfx.setTextColor(COL_RED); gfx.setTextSize(2); gfx.print("Path Err"); return;
+    }
+    if (!LittleFS.exists(path)) {
+        gfx.setCursor(x_pos > 0 ? x_pos : 10, y_pos > 0 ? y_pos : SCREEN_HEIGHT_VAL / 2 );
+        gfx.setTextColor(COL_RED); gfx.setTextSize(2); gfx.print("File Err");
+        currentBackgroundImagePath = ""; needsGifBackgroundUpdate = true; return;
+    }
+    if (path.endsWith(".jpg") || path.endsWith(".jpeg")) {
+        File jpegFile = LittleFS.open(path, "r");
+        if (!jpegFile) {
+            gfx.setCursor(x_pos > 0 ? x_pos : 10, y_pos > 0 ? y_pos : SCREEN_HEIGHT_VAL / 2);
+            gfx.setTextColor(COL_RED); gfx.setTextSize(2); gfx.print("JPEG Err"); return;
+        }
+        TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(false); 
+        TJpgDec.setCallback(tft_output_callback_jpeg);
+        TJpgDec.drawFsJpg(x_pos, y_pos, jpegFile); 
+        jpegFile.close();
+    }
+}
+
+void displayRandomBackgroundImage() {
+    if (!littleFSReady) return;
+    String dirPath = "/img";
+    File root = LittleFS.open(dirPath);
+    if (!root || !root.isDirectory()) {
+        gfx.fillScreen(COL_BLACK); 
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2); gfx.setTextColor(COL_WHITE); gfx.setTextSize(2);
+        gfx.println("No /img dir!");
+        if (currentBackgroundImagePath != "") needsGifBackgroundUpdate = true; 
+        currentBackgroundImagePath = ""; return;
+    }
+    std::vector<String> imageFilesFullPaths;
+    File file = root.openNextFile();
+    while (file) {
+        String leafName = String(file.name()); 
+        if (!file.isDirectory() && (leafName.endsWith(".jpg") || leafName.endsWith(".jpeg"))) {
+            String fullPath = dirPath + "/" + leafName;
+            if (leafName.startsWith("/")) { 
+                fullPath = dirPath + leafName;
+                fullPath.replace("//","/"); 
+            }
+            imageFilesFullPaths.push_back(fullPath);
+        }
+        file.close(); file = root.openNextFile();
+    }
+    root.close();
+    if (imageFilesFullPaths.empty()) {
+        gfx.fillScreen(COL_BLACK); 
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2); gfx.setTextColor(COL_WHITE); gfx.setTextSize(2);
+        gfx.println("No JPEG files!");
+        if (currentBackgroundImagePath != "") needsGifBackgroundUpdate = true;
+        currentBackgroundImagePath = ""; return;
+    }
+    String imagePathToDisplay;
+    if (imageFilesFullPaths.size() == 1) {
+        imagePathToDisplay = imageFilesFullPaths[0];
+    } else {
+        int randomIndex; int attempts = 0; 
+        do {
+            randomIndex = random(imageFilesFullPaths.size());
+            imagePathToDisplay = imageFilesFullPaths[randomIndex];
+            attempts++;
+        } while (imagePathToDisplay == currentBackgroundImagePath && attempts < imageFilesFullPaths.size() * 2); 
+    }
+    if (imagePathToDisplay != currentBackgroundImagePath || currentBackgroundImagePath.isEmpty()) {
+         currentBackgroundImagePath = imagePathToDisplay; 
+         drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+    } else if (imageFilesFullPaths.size() == 1 && currentBackgroundImagePath == imagePathToDisplay) {
+        drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+    }
+}
+
+void drawClockDisplay(struct tm *pTimeinfo, bool timeIsValid) {
+    char timeStr[6]; 
+    if(!timeIsValid) strcpy(timeStr, "--:--");
+    else sprintf(timeStr, "%02d:%02d", pTimeinfo->tm_hour, pTimeinfo->tm_min);
+    int clockY = (SCREEN_HEIGHT_VAL - OVERLAY_HEIGHT) + CLOCK_TEXT_Y_OFFSET;
+    drawTextWithOutline(String(timeStr), CLOCK_TEXT_X, clockY, COL_WHITE, COL_BLACK, CLOCK_FONT_SIZE);
+}
+
+String convertToNonAccentVietnamese(String str) {
+  str.replace("á", "a"); str.replace("à", "a"); str.replace("ả", "a"); str.replace("ã", "a"); str.replace("ạ", "a"); str.replace("â", "a"); str.replace("ấ", "a"); str.replace("ầ", "a"); str.replace("ẩ", "a"); str.replace("ẫ", "a"); str.replace("ậ", "a"); str.replace("ă", "a"); str.replace("ắ", "a"); str.replace("ằ", "a"); str.replace("ẳ", "a"); str.replace("ẵ", "a"); str.replace("ặ", "a"); str.replace("Á", "A"); str.replace("À", "A"); str.replace("Ả", "A"); str.replace("Ã", "A"); str.replace("Ạ", "A"); str.replace("Â", "A"); str.replace("Ấ", "A"); str.replace("Ầ", "A"); str.replace("Ẩ", "A"); str.replace("Ẫ", "A"); str.replace("Ậ", "A"); str.replace("Ă", "A"); str.replace("Ắ", "A"); str.replace("Ằ", "A"); str.replace("Ẳ", "A"); str.replace("Ẵ", "A"); str.replace("Ặ", "A"); str.replace("é", "e"); str.replace("è", "e"); str.replace("ẻ", "e"); str.replace("ẽ", "e"); str.replace("ẹ", "e"); str.replace("ê", "e"); str.replace("ế", "e"); str.replace("ề", "e"); str.replace("ể", "e"); str.replace("ễ", "e"); str.replace("ệ", "e"); str.replace("É", "E"); str.replace("È", "E"); str.replace("Ẻ", "E"); str.replace("Ẽ", "E"); str.replace("Ẹ", "E"); str.replace("Ê", "E"); str.replace("Ế", "E"); str.replace("Ề", "E"); str.replace("Ể", "E"); str.replace("Ễ", "E"); str.replace("Ệ", "E"); str.replace("í", "i"); str.replace("ì", "i"); str.replace("ỉ", "i"); str.replace("ĩ", "i"); str.replace("ị", "i"); str.replace("Í", "I"); str.replace("Ì", "I"); str.replace("Ỉ", "I"); str.replace("Ĩ", "I"); str.replace("Ị", "I"); str.replace("ó", "o"); str.replace("ò", "o"); str.replace("ỏ", "o"); str.replace("õ", "o"); str.replace("ọ", "o"); str.replace("ô", "o"); str.replace("ố", "o"); str.replace("ồ", "o"); str.replace("ổ", "o"); str.replace("ỗ", "o"); str.replace("ộ", "o"); str.replace("ơ", "o"); str.replace("ớ", "o"); str.replace("ờ", "o"); str.replace("ở", "o"); str.replace("ỡ", "o"); str.replace("ợ", "o"); str.replace("Ó", "O"); str.replace("Ò", "O"); str.replace("Ỏ", "O"); str.replace("Õ", "O"); str.replace("Ọ", "O"); str.replace("Ô", "O"); str.replace("Ố", "O"); str.replace("Ồ", "O"); str.replace("Ổ", "O"); str.replace("Ỗ", "O"); str.replace("Ộ", "O"); str.replace("Ơ", "O"); str.replace("Ớ", "O"); str.replace("Ờ", "O"); str.replace("Ở", "O"); str.replace("Ỡ", "O"); str.replace("Ợ", "O"); str.replace("ú", "u"); str.replace("ù", "u"); str.replace("ủ", "u"); str.replace("ũ", "u"); str.replace("ụ", "u"); str.replace("ư", "u"); str.replace("ứ", "u"); str.replace("ừ", "u"); str.replace("ử", "u"); str.replace("ữ", "u"); str.replace("ự", "u"); str.replace("Ú", "U"); str.replace("Ù", "U"); str.replace("Ủ", "U"); str.replace("Ũ", "U"); str.replace("Ụ", "U"); str.replace("Ư", "U"); str.replace("Ứ", "U"); str.replace("Ừ", "U"); str.replace("Ử", "U"); str.replace("Ữ", "U"); str.replace("Ự", "U"); str.replace("ý", "y"); str.replace("ỳ", "y"); str.replace("ỷ", "y"); str.replace("ỹ", "y"); str.replace("ỵ", "y"); str.replace("Ý", "Y"); str.replace("Ỳ", "Y"); str.replace("Ỷ", "Y"); str.replace("Ỹ", "Y"); str.replace("Ỵ", "Y"); str.replace("đ", "d"); str.replace("Đ", "D");
+  return str;
+}
+
+String getVietnameseWeatherDescription(String iconCode, String apiDescription) {
+    if (!apiDescription.isEmpty()) return convertToNonAccentVietnamese(apiDescription);
+    if (iconCode == "01d") return "It may, troi nang"; if (iconCode == "01n") return "It may, troi quang";
+    if (iconCode == "02d") return "May rai rac"; if (iconCode == "02n") return "May rai rac";      
+    if (iconCode == "03d" || iconCode == "03n") return "May cum"; if (iconCode == "04d" || iconCode == "04n") return "Nhieu may";
+    if (iconCode == "09d" || iconCode == "09n") return "Mua rao"; if (iconCode == "10d") return "Mua, nang gian doan";
+    if (iconCode == "10n") return "Mua"; if (iconCode == "11d" || iconCode == "11n") return "Dong";   
+    if (iconCode == "13d" || iconCode == "13n") return "Tuyet"; if (iconCode == "50d" || iconCode == "50n") return "Suong mu";
+    return "Khong ro"; 
+}
+
+void fetchWeatherData() {
+    if (WiFi.status() != WL_CONNECTED) {
+        currentWeatherIconCode = "offline"; currentTemperature = -999.0f; currentWeatherDescription = "Ngoai tuyen"; return;
+    }
+    if (openWeatherMapApiKey.length() < 10) { 
+        currentWeatherIconCode = "no_key"; currentTemperature = -999.0f; currentWeatherDescription = "Loi API Key"; return;
+    }
+    HTTPClient http; String encodedCity = urlEncode(city); 
+    String apiURL = "http://api.openweathermap.org/data/2.5/weather?q=" + encodedCity + "," + countryCode + "&appid=" + openWeatherMapApiKey + "&units=metric&lang=vi";
+    http.begin(apiURL); 
+    int httpResponseCode = http.GET(); String payload = "";
+    if (httpResponseCode == HTTP_CODE_OK) {
+        payload = http.getString();
+        DynamicJsonDocument doc(1024); 
+        DeserializationError error = deserializeJson(doc, payload);
+        if (error) {
+            currentWeatherIconCode = "json_err"; currentTemperature = -999.0f; currentWeatherDescription = "Loi JSON";
+        } else {
+            if(doc["weather"].isNull() || !doc["weather"].is<JsonArray>() || doc["weather"].as<JsonArray>().size() == 0) {
+                currentWeatherIconCode = "bad_json"; currentTemperature = -999.0f; currentWeatherDescription = "JSON sai";
+            } else {
+                JsonObject weather_0 = doc["weather"][0];
+                currentWeatherIconCode = weather_0["icon"].as<String>();
+                String apiDesc = weather_0["description"].as<String>();  
+                currentWeatherDescription = getVietnameseWeatherDescription(currentWeatherIconCode, apiDesc);
+                if (doc["main"].is<JsonObject>()) currentTemperature = doc["main"]["temp"].as<float>();
+                else currentTemperature = -999.0f; 
+            }
+        }
+    } else {
+        currentWeatherIconCode = "http_err"; currentTemperature = -999.0f; currentWeatherDescription = "Loi HTTP";
+    }
+    http.end(); 
+}
+
+void drawWeatherInfo() {
+    int tempY = (SCREEN_HEIGHT_VAL - OVERLAY_HEIGHT) + WEATHER_TEXT_Y_OFFSET;
+    String tempStr = "";
+    if (currentTemperature > -273.0f) { 
+        char tempFormatBuffer[12];
+        snprintf(tempFormatBuffer, sizeof(tempFormatBuffer), "%.1fc", currentTemperature); tempStr = String(tempFormatBuffer);
+    } else tempStr = "--c"; 
+    String descriptionStr = currentWeatherDescription;
+    int16_t x1_temp, y1_temp; uint16_t w_temp, h_temp;
+    gfx.setTextSize(WEATHER_FONT_SIZE);
+    gfx.getTextBounds(tempStr, 0, 0, &x1_temp, &y1_temp, &w_temp, &h_temp);
+    int actualTextX = WEATHER_TEXT_X_OFFSET;
+    drawTextWithOutline(tempStr, actualTextX, tempY, COL_WHITE, COL_BLACK, WEATHER_FONT_SIZE);
+    if (!descriptionStr.isEmpty()) {
+        int descriptionY = tempY + WEATHER_CHAR_PIXEL_HEIGHT + WEATHER_LINE_SPACING;
+        if (descriptionY + WEATHER_CHAR_PIXEL_HEIGHT <= SCREEN_HEIGHT_VAL) {
+             drawTextWithOutline(descriptionStr, actualTextX, descriptionY, COL_WHITE, COL_BLACK, WEATHER_FONT_SIZE);
+        }
+    }
+}
+
+void scanAnimationFiles() {
+    if (!littleFSReady) {
+        animationFilesList.clear(); currentAnimationPath = ""; return;
+    }
+    animationFilesList.clear(); String dirPath = "/anim";
+    File animDir = LittleFS.open(dirPath);
+    if (!animDir || !animDir.isDirectory()) { currentAnimationPath = ""; return; }
+    File file = animDir.openNextFile();
+    while(file) {
+        String leafName = String(file.name());
+        if (!file.isDirectory() && (leafName.endsWith(".gif") || leafName.endsWith(".GIF"))) {
+            String fullPath = dirPath + "/" + leafName;
+            if (leafName.startsWith("/")) { 
+                fullPath = dirPath + leafName; fullPath.replace("//", "/"); 
+            }
+            animationFilesList.push_back(fullPath);
+        }
+        file.close(); file = animDir.openNextFile();
+    }
+    animDir.close();
+    if (!animationFilesList.empty()) {
+        if (animationFilesList.size() == 1) { 
+            currentAnimationPath = animationFilesList[0];
+        } else if (!lastGifPlayed.isEmpty()) { 
+            String newPath; int attempts = 0; 
+            do { 
+                newPath = animationFilesList[random(animationFilesList.size())]; attempts++;
+            } while (newPath == lastGifPlayed && attempts < (animationFilesList.size() * 2 + 5)); 
+            currentAnimationPath = newPath;
+        } else { 
+             currentAnimationPath = animationFilesList[random(animationFilesList.size())];
+        }
+    } else currentAnimationPath = ""; 
+}
+
+void drawAnimation() {
+    if (!littleFSReady || (!gifBackgroundBuffer || !gifActiveBuffer) ) { 
+        if (gif.getCanvasWidth() > 0) gif.close();
+        return;
+    }
+    if (currentAnimationPath.isEmpty()) {
+        if (gif.getCanvasWidth() > 0) { 
+            gif.close(); 
+            if (gifBackgroundBuffer && !needsGifBackgroundUpdate) {
+                 gfx.draw16bitRGBBitmap(GIF_AREA_X, GIF_AREA_Y, gifBackgroundBuffer, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT);
+            } else {
+                 gfx.fillRect(GIF_AREA_X, GIF_AREA_Y, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT, COL_BLACK); 
+            }
+        }
+        return; 
+    }
+    if (lastGifPlayed != currentAnimationPath || gif.getCanvasWidth() == 0) {
+        gif.close(); 
+        if (needsGifBackgroundUpdate && gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+            captureAndStoreGifBackground();
+        }
+        currentGifDrawTarget = DRAW_TO_ACTIVE_BUFFER; 
+        int openResult = gif.open(currentAnimationPath.c_str(), GIFOpenFileLFS, GIFCloseFileLFS, GIFReadFileLFS, GIFSeekFileLFS, GIFDrawCallback);
+        if (openResult == 1) { 
+            if (gif.getCanvasWidth() > MAX_GIF_DIMENSION || gif.getCanvasHeight() > MAX_GIF_DIMENSION) {
+                gif.close(); lastGifPlayed = currentAnimationPath; currentAnimationPath = ""; return;
+            }
+            lastGifPlayed = currentAnimationPath; 
+        } else { 
+            lastGifPlayed = currentAnimationPath; currentAnimationPath = ""; return;
+        }
+    }
+    if (!currentAnimationPath.isEmpty() && lastGifPlayed == currentAnimationPath && gif.getCanvasWidth() > 0) {
+        if (gifBackgroundBuffer && gifActiveBuffer && !needsGifBackgroundUpdate) { 
+            memcpy(gifActiveBuffer, gifBackgroundBuffer, (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT * sizeof(uint16_t));
+        } else if (gifActiveBuffer) { 
+            for(size_t i=0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) gifActiveBuffer[i] = COL_BLACK;
+            if (!gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) needsGifBackgroundUpdate = true;
+        } else return;
+        currentGifDrawTarget = DRAW_TO_ACTIVE_BUFFER;
+        int iDecodeStatus = gif.playFrame(true, nullptr); 
+        if (iDecodeStatus == 1) { 
+            if (gifActiveBuffer) gfx.draw16bitRGBBitmap(GIF_AREA_X, GIF_AREA_Y, gifActiveBuffer, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT);
+        } else if (iDecodeStatus == 0) { 
+            gif.reset(); 
+        } else if (iDecodeStatus < 0) { 
+            gif.close(); lastGifPlayed = currentAnimationPath; currentAnimationPath = ""; 
+        }
+    }
+}
+
+String urlEncode(String str) {
+    String encodedString = ""; char c; char code0; char code1;
+    for (unsigned int i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (c == ' ') encodedString += "%20";
+        else if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') encodedString += c;
+        else {
+            code1 = (c & 0xf) + '0'; if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
+            c = (c >> 4) & 0xf; code0 = c + '0'; if (c > 9) code0 = c - 10 + 'A';
+            encodedString += '%'; encodedString += code0; encodedString += code1;
+        }
+    }
+    return encodedString;
+}
+
+// --- Telegram Bot and WOL Functions ---
+void handleTelegramBot() {
+    Serial.println("handleTelegramBot: Checking for new messages..."); // DEBUG
+    if (WiFi.status() != WL_CONNECTED || authorizedTelegramChatId.isEmpty()) {
+        Serial.println("handleTelegramBot: WiFi not connected or no authorized Chat ID. Returning."); // DEBUG
+        return; 
+    }
+
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    Serial.printf("handleTelegramBot: Found %d new messages.\n", numNewMessages); // DEBUG
+
+    for (int i = 0; i < numNewMessages; i++) {
+        String chatId = String(bot.messages[i].chat_id);
+        String text = bot.messages[i].text;
+        String fromName = bot.messages[i].from_name;
+
+        Serial.println("--- New Telegram Message ---"); // DEBUG
+        Serial.printf("From: %s (Chat ID: %s)\n", fromName.c_str(), chatId.c_str()); // DEBUG
+        Serial.printf("Text: %s\n", text.c_str()); // DEBUG
+        Serial.println("Authorized Chat ID: " + authorizedTelegramChatId); // DEBUG
+        
+        bool isAuthorized = (chatId == authorizedTelegramChatId);
+        Serial.printf("Is authorized: %s\n", isAuthorized ? "true" : "false"); // DEBUG
+
+        if (!isAuthorized) {
+            bot.sendMessage(chatId, "Xin loi, ban khong duoc phep su dung bot nay.", "");
+            Serial.println("Chat ID khong duoc phep. Sent unauthorized message."); // DEBUG
+            continue;
+        }
+
+        Serial.println("Processing authorized message..."); // DEBUG
+        if (text.startsWith("/wol")) {
+            String targetDevice = text.substring(5); 
+            targetDevice.trim();
+            Serial.printf("WOL command. Target: '%s'\n", targetDevice.c_str()); // DEBUG
+
+            if (targetDevice.length() == 0) {
+                String helpMsg = "Su dung: /wol <ten_thiet_bi_hoac_MAC>\nCac thiet bi da cau hinh:\n";
+                if (wolDeviceList.empty()) {
+                    helpMsg += "Chua co thiet bi nao duoc cau hinh.";
+                } else {
+                    for (const auto& dev : wolDeviceList) {
+                        helpMsg += "- " + dev.name + " (" + dev.mac + ")\n";
+                    }
+                }
+                bot.sendMessage(chatId, helpMsg, "");
+                Serial.println("Sent WOL help message (no target)."); // DEBUG
+                continue;
+            }
+            
+            String macToWake = getDeviceMacByName(targetDevice);
+            Serial.printf("MAC for target '%s': '%s'\n", targetDevice.c_str(), macToWake.c_str()); // DEBUG
+
+            if (macToWake.length() > 0) {
+                sendWolPacket(macToWake);
+                bot.sendMessage(chatId, "Da gui lenh Wake-on-LAN den " + targetDevice + " (" + macToWake + ").", "");
+                Serial.println("Sent WOL packet and confirmation."); // DEBUG
+            } else {
+                bot.sendMessage(chatId, "Khong tim thay thiet bi hoac MAC: " + targetDevice, "");
+                Serial.println("WOL target not found."); // DEBUG
+            }
+        } else if (text == "/start" || text == "/help") {
+            Serial.println("Start/Help command received."); // DEBUG
+            String welcomeMessage = "Chao " + fromName + "!\n";
+            welcomeMessage += "Day la bot dieu khien Wake-on-LAN cho ESP32 Photo Frame.\n";
+            welcomeMessage += "Su dung lenh /wol <ten_thiet_bi_hoac_MAC> de danh thuc.\n";
+            welcomeMessage += "Vi du: /wol MyPC\n";
+            welcomeMessage += "Cac thiet bi da cau hinh:\n";
+             if (wolDeviceList.empty()) {
+                welcomeMessage += "Chua co thiet bi nao duoc cau hinh.";
+            } else {
+                for (const auto& dev : wolDeviceList) {
+                    welcomeMessage += "- " + dev.name + " (" + dev.mac + ")\n";
+                }
+            }
+            bot.sendMessage(chatId, welcomeMessage, "");
+            Serial.println("Sent welcome/help message."); // DEBUG
+        } else {
+            Serial.println("Unknown command."); // DEBUG
+            // Optionally, send a message for unknown commands
+            // bot.sendMessage(chatId, "Lenh khong duoc nhan dien. Thu /help.", "");
+        }
+         bot.last_message_received = bot.messages[i].update_id; // Mark message as processed
+         Serial.printf("Updated last_message_received to: %ld\n", bot.last_message_received); // DEBUG
+    }
+}
+
+String getDeviceMacByName(const String& deviceNameOrMac) {
+    // Thử tìm theo tên trước
+    for (const auto& dev : wolDeviceList) {
+        if (dev.name.equalsIgnoreCase(deviceNameOrMac)) {
+            return dev.mac;
+        }
+    }
+    // Nếu không tìm thấy theo tên, kiểm tra xem đầu vào có phải là địa chỉ MAC không
+    uint8_t tempMac[6];
+    if (parseMacAddress(deviceNameOrMac, tempMac)) {
+        return deviceNameOrMac; // Nếu là MAC hợp lệ, trả về chính nó
+    }
+    return ""; // Không tìm thấy
+}
+
+
+bool parseMacAddress(const String& macStr, uint8_t* macBytes) {
+    if (macStr.length() != 17) return false; // XX:XX:XX:XX:XX:XX
+    int byteIndex = 0;
+    for (int i = 0; i < macStr.length(); i += 3) {
+        if (byteIndex >= 6) return false; // Quá nhiều byte
+        char highNibble = macStr.charAt(i);
+        char lowNibble = macStr.charAt(i + 1);
+        if (i + 2 < macStr.length() && macStr.charAt(i + 2) != ':' && byteIndex < 5) return false; // Dấu : sai vị trí
+
+        uint8_t byteVal = 0;
+        // Chuyển đổi high nibble
+        if (highNibble >= '0' && highNibble <= '9') byteVal = (highNibble - '0') << 4;
+        else if (highNibble >= 'A' && highNibble <= 'F') byteVal = (highNibble - 'A' + 10) << 4;
+        else if (highNibble >= 'a' && highNibble <= 'f') byteVal = (highNibble - 'a' + 10) << 4;
+        else return false; // Ký tự không hợp lệ
+
+        // Chuyển đổi low nibble
+        if (lowNibble >= '0' && lowNibble <= '9') byteVal |= (lowNibble - '0');
+        else if (lowNibble >= 'A' && lowNibble <= 'F') byteVal |= (lowNibble - 'A' + 10);
+        else if (lowNibble >= 'a' && lowNibble <= 'f') byteVal |= (lowNibble - 'a' + 10);
+        else return false; // Ký tự không hợp lệ
+        
+        macBytes[byteIndex++] = byteVal;
+    }
+    return byteIndex == 6;
+}
+
+void sendWolPacket(const String& macAddressStr) {
+    uint8_t mac[6];
+    if (!parseMacAddress(macAddressStr, mac)) {
+        Serial.println("Dia chi MAC khong hop le: " + macAddressStr);
+        return;
+    }
+
+    WiFiUDP udp;
+    uint8_t magicPacket[102];
+
+    // 6 byte FF
+    for (int i = 0; i < 6; i++) {
+        magicPacket[i] = 0xFF;
+    }
+    // 16 lần lặp lại địa chỉ MAC
+    for (int i = 1; i <= 16; i++) {
+        for (int j = 0; j < 6; j++) {
+            magicPacket[i * 6 + j] = mac[j];
+        }
+    }
+
+    // Gửi packet đến địa chỉ broadcast, port 9 (hoặc 7)
+    // IPAddress broadcastIp(255, 255, 255, 255); // Cách này có thể không hoạt động trên một số mạng
+    // Thay vào đó, tính toán địa chỉ broadcast của mạng con hiện tại
+    IPAddress localIp = WiFi.localIP();
+    IPAddress subnetMask = WiFi.subnetMask();
+    IPAddress broadcastIp = localIp | ~subnetMask;
+
+
+    if (udp.beginPacket(broadcastIp, 9)) { // Port 9 là chuẩn cho WOL
+        udp.write(magicPacket, sizeof(magicPacket));
+        if (udp.endPacket()) {
+            Serial.println("Da gui Magic Packet den " + macAddressStr + " tai " + broadcastIp.toString());
+        } else {
+            Serial.println("Loi gui Magic Packet (endPacket failed)");
+        }
+    } else {
+        Serial.println("Loi khoi tao UDP packet (beginPacket failed)");
+    }
+}

@@ -1,0 +1,2685 @@
+//=================================================================================================
+// MÃ NGUỒN CHO ESP32 PHOTO FRAME (TFT DISPLAY - Arduino_GFX)
+// Bao gồm: Đồng hồ, Thời tiết (Text Tiếng Việt không dấu), Ảnh GIF (góc phải dưới), Ảnh nền,
+// Cấu hình WiFi và Quản lý file qua Web Interface, Cấu hình API thời tiết qua Web, Điều khiển độ sáng, Xóa WiFi đã lưu.
+//
+// Dựa trên mã nguồn do người dùng cung cấp và các yêu cầu tùy chỉnh.
+// Version 40.2_mod23_gif_buffer_v4_gif_sync_loop (Bởi Gemini):
+// - Đồng bộ việc thay đổi GIF với thay đổi ảnh nền.
+// - GIF sẽ phát lặp lại liên tục cho đến khi ảnh nền thay đổi.
+//=================================================================================================
+
+// --- CÁC THƯ VIỆN CẦN THIẾT ---
+#include <Arduino_GFX_Library.h>
+#include <WiFi.h>
+#include <WebServer.h>      // SỬ DỤNG WebServer tích hợp
+#include "LittleFS.h"
+#include <TJpg_Decoder.h>
+#include <WiFiUdp.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <vector>
+#include <algorithm>
+#include <AnimatedGIF.h>
+#include "time.h"
+#include <math.h> // Thêm thư viện math.h để dùng hàm roundf
+
+// --- Cấu hình ---
+const char* AP_SSID = "ESP32-PhotoFrame-Setup";
+const char* AP_PASSWORD = NULL; // Mở mạng AP nếu NULL
+
+// Màn hình TFT
+#define TFT_CS    18
+#define TFT_DC    16
+#define TFT_RST   17
+#define TFT_SCK   36
+#define TFT_MOSI  35
+#define TFT_MISO  -1 // Không sử dụng MISO cho màn hình này
+#define TFT_BL    37 // Đèn nền LED của màn hình nối vào chân 37 (S2 Mini D1)
+
+// Cấu hình cho đèn nền (sử dụng analogWrite)
+const char* BRIGHTNESS_CONFIG_PATH = "/brightness.txt";
+uint8_t currentBrightness = 255; // Giá trị độ sáng hiện tại (0-255), mặc định là sáng nhất
+
+Arduino_ESP32SPI bus(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, TFT_MISO);
+Arduino_ILI9341 gfx(&bus, TFT_RST);
+
+WebServer server(80);
+File fsUploadFile;
+bool g_uploadErrorOccurred = false;
+String g_uploadWarningMessage = ""; // Biến toàn cục để lưu trữ cảnh báo
+
+// Ngưỡng cảnh báo bộ nhớ (ví dụ: 200KB)
+const size_t LOW_MEMORY_THRESHOLD = 200 * 1024;
+bool littleFSReady = false; // Cờ trạng thái của LittleFS
+
+
+// NTP Settings for configTime()
+const char* ntpServerPrimary = "pool.ntp.org";
+const char* ntpServerSecondary = "time.google.com";
+const long  gmtOffset_sec = 7 * 3600; // GMT+7
+const int   daylightOffset_sec = 0; // Không có DST
+
+// --- Bố cục và Kích thước Màn hình ---
+uint16_t SCREEN_WIDTH_VAL = 320;
+uint16_t SCREEN_HEIGHT_VAL = 240;
+
+const int OVERLAY_HEIGHT = 40; // Chiều cao của vùng overlay dưới cùng (chứa đồng hồ, thời tiết)
+
+// Clock text display
+const int CLOCK_FONT_SIZE = 3;
+const int CLOCK_CHAR_HEIGHT = 8 * CLOCK_FONT_SIZE; // 24 pixels
+const int CLOCK_TEXT_X = 10; // Tọa độ X của đồng hồ
+const int CLOCK_TEXT_Y_OFFSET = (OVERLAY_HEIGHT - CLOCK_CHAR_HEIGHT) / 2; // (40-24)/2 = 8. Căn giữa theo chiều dọc
+
+// Weather text display
+const int WEATHER_TEXT_X_OFFSET = 115; // Vị trí bắt đầu của khối thời tiết, tính từ mép trái màn hình
+const int WEATHER_FONT_SIZE = 1;
+const int WEATHER_CHAR_PIXEL_HEIGHT = 8 * WEATHER_FONT_SIZE; // Chiều cao thực tế của 1 dòng chữ thời tiết
+// WEATHER_TEXT_Y_OFFSET sẽ tính toán vị trí Y cho dòng đầu tiên (nhiệt độ) để căn giữa 1 dòng trong overlay
+const int WEATHER_TEXT_Y_OFFSET = (OVERLAY_HEIGHT - WEATHER_CHAR_PIXEL_HEIGHT) / 2; // (40-8)/2 = 16. Dòng đầu tiên sẽ ở vị trí này.
+const int WEATHER_LINE_SPACING = 2; // Khoảng cách điểm ảnh giữa dòng nhiệt độ và dòng mô tả
+
+
+// GIF display settings
+#define DISPLAY_DPI 110 // DPI ước tính của màn hình (cần điều chỉnh cho chính xác)
+const float GIF_TARGET_HEIGHT_CM = 1.5; // Chiều cao mong muốn của GIF trên màn hình (cm)
+const float GIF_TARGET_WIDTH_CM = 1.5;  // Chiều rộng mong muốn của GIF trên màn hình (cm)
+const float INCH_TO_CM = 2.54;
+
+int GIF_TARGET_PIXEL_HEIGHT; // Sẽ được tính toán trong setup()
+int GIF_TARGET_PIXEL_WIDTH;  // Sẽ được tính toán trong setup()
+int GIF_AREA_X;              // Tọa độ X của vùng GIF (góc trên trái)
+int GIF_AREA_Y;              // Tọa độ Y của vùng GIF (góc trên trái)
+const int GIF_MARGIN = 5;    // Khoảng cách từ mép màn hình/overlay đến GIF
+const int MAX_GIF_DIMENSION = 480;  // Giới hạn kích thước GIF gốc để tránh quá tải bộ nhớ
+
+// Background image settings
+String currentBackgroundImagePath = "";
+unsigned long lastImageChangeTime = 0;
+const long imageChangeInterval = 30000; // 30 giây đổi ảnh nền
+
+// GIF animation variables
+AnimatedGIF gif;
+String currentAnimationPath = ""; // Đường dẫn đến file GIF đang được phát hoặc sẽ phát
+File gifFileHandle; // Biến toàn cục cho file GIF, được quản lý bởi AnimatedGIF
+String lastGifPlayed = "";    // Theo dõi file GIF đã phát cuối cùng để tránh lặp lại ngay
+std::vector<String> animationFilesList; // Danh sách các file GIF có sẵn
+
+// --- GIF Background and Double Buffering ---
+uint16_t* gifBackgroundBuffer = nullptr; // Buffer để lưu phần ảnh nền tĩnh phía sau GIF
+uint16_t* gifActiveBuffer = nullptr;     // Buffer hoạt động để vẽ GIF (Double Buffering)
+bool g_isCapturingForGifBackgroundBuffer = false;  // Cờ báo cho callback biết có đang capture cho buffer nền không
+// Các thông số của vùng ảnh gốc cần copy vào buffer nền
+int g_captureSourceImgX = 0;
+int g_captureSourceImgY = 0;
+int g_captureSourceWidth = 0;
+int g_captureSourceHeight = 0;
+// Cờ báo hiệu cần cập nhật buffer nền cho GIF
+bool needsGifBackgroundUpdate = true;
+String lastCapturedBackgroundImagePath = ""; // Theo dõi ảnh nền đã được chụp cho buffer
+
+// Cờ báo cho GIFDrawCallback biết nó đang vẽ vào buffer nào
+enum GIFDrawTarget { DRAW_TO_SCREEN, DRAW_TO_ACTIVE_BUFFER }; // DRAW_TO_SCREEN không còn dùng trực tiếp
+GIFDrawTarget currentGifDrawTarget = DRAW_TO_ACTIVE_BUFFER; // Mặc định vẽ vào active buffer
+
+// Weather settings
+String openWeatherMapApiKey = "7b6175c7486e498e90b7cfe5f81bc908"; // Thay bằng API key của bạn
+String city = "Vinh Phuc"; // Thành phố mặc định
+String countryCode = "VN"; // Mã quốc gia mặc định
+const char* WEATHER_CONFIG_PATH = "/weather_cfg.json"; // File lưu cấu hình thời tiết
+unsigned long weatherUpdateInterval = 5 * 60 * 1000; // 5 phút cập nhật thời tiết một lần
+
+String currentWeatherIconCode = "unknown"; // Mã icon thời tiết hiện tại (ví dụ: "01d")
+String currentWeatherDescription = "Dang tai..."; // Mô tả thời tiết hiện tại
+float currentTemperature = -999.0f; // Nhiệt độ hiện tại, -999.0f là giá trị không hợp lệ/chưa có
+unsigned long lastWeatherUpdateTime = 0; // Thời điểm cập nhật thời tiết cuối cùng
+unsigned long lastOverlayRedrawTime = 0; // Thời điểm vẽ lại overlay cuối cùng
+int lastMinuteDisplayed = -1; // Phút cuối cùng được hiển thị trên đồng hồ
+
+// WiFi credentials storage
+String wifi_ssid_stored = "";
+String wifi_password_stored = "";
+bool wifiManagerMode = false; // Sẽ là true nếu ở AP mode, false nếu ở STA mode
+const char* WIFI_SSID_PATH = "/wifi_ssid.txt";
+const char* WIFI_PASS_PATH = "/wifi_pass.txt";
+
+// Color definitions
+uint16_t COL_BLACK;
+uint16_t COL_WHITE;
+uint16_t COL_RED;
+uint16_t COL_GREEN;
+uint16_t COL_BLUE;
+uint16_t COL_YELLOW;
+uint16_t COL_DARKGREY;
+uint16_t COL_LIGHTGREY;
+uint16_t COL_CYAN;
+
+// --- Forward Declarations ---
+void GIFDrawCallback(GIFDRAW *pDraw);
+void * GIFOpenFileLFS(const char *fname, int32_t *pFileSize);
+void GIFCloseFileLFS(void *pHandle);
+int32_t GIFReadFileLFS(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen);
+int32_t GIFSeekFileLFS(GIFFILE *pFile, int32_t iPosition);
+
+bool tft_output_callback_jpeg(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap);
+bool tft_output_to_gif_background_buffer_callback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap_data);
+void captureAndStoreGifBackground();
+
+void drawFsImage(const String& path, int x_pos, int y_pos, int w_max = 0, int h_max = 0);
+void displayRandomBackgroundImage();
+void scanAnimationFiles();
+void drawAnimation();
+void drawTextWithOutline(const String& text, int16_t x, int16_t y, uint16_t fgColor, uint16_t outlineColor, uint8_t textSize);
+void drawBottomOverlay(); // Hiện không dùng trực tiếp, các thành phần được vẽ riêng
+void drawClockDisplay(struct tm *pTimeinfo, bool timeIsValid);
+void fetchWeatherData();
+String convertToNonAccentVietnamese(String text);
+String getVietnameseWeatherDescription(String iconCode, String apiDescription);
+void drawWeatherInfo();
+String urlEncode(String str);
+void handleUpload();
+void handleUploadFinal(String successMessage);
+void handleRoot();
+void handleListFilesAPI();
+void handleDeleteFileAPI();
+void handleReboot();
+bool loadWiFiCredentials();
+void saveWiFiCredentials(const String& ssid, const String& password);
+void deleteWiFiCredentials();
+void startAPMode();
+void startSTAModeAndMainApp();
+void handleWifiConfigRoot();
+void handleWifiSave();
+void handleScanWifi();
+void handleNotFound();
+void handleGetWeatherConfig();
+void handleSaveWeatherConfig();
+void loadWeatherConfig();
+void handleSTAWifiSetupPage();
+void handleGetCurrentSsid();
+void handleStorageInfo();
+void handleSetBrightness();
+void handleGetBrightness();
+void saveBrightnessSetting(uint8_t brightness);
+void loadBrightnessSetting();
+void setBacklightBrightness(uint8_t brightness);
+void handleDeleteWifi();
+
+
+// --- HTML Content (cho WebServer) ---
+// WiFi Configuration Page (Used for both AP mode and STA mode change)
+const char wifi_config_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+<title>Cau Hinh WiFi</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" charset="UTF-8">
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+  .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+  h1 { color: #007bff; text-align: center; }
+  label { display: block; margin-top: 15px; margin-bottom: 5px; font-weight: bold; }
+  input[type="text"], input[type="password"], select { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; }
+  button, input[type="submit"] { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-top:10px; }
+  button:hover, input[type="submit"]:hover { background-color: #0056b3; }
+  .scan-btn { background-color: #28a745; }
+  .scan-btn:hover { background-color: #218838; }
+  #status { margin-top: 15px; padding: 10px; background-color: #e9ecef; border-radius: 4px; text-align: center; }
+  .hidden { display: none; }
+  ul { list-style: none; padding:0; }
+  li { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+  li:hover { background-color: #f0f0f0; }
+  li:last-child { border-bottom: none; }
+  .back-link { display: block; text-align: center; margin-top: 20px; color: #007bff; text-decoration: none;}
+</style>
+</head><body>
+<div class="container">
+  <h1>Cấu hình WiFi</h1>
+  <form id="wifiForm" method="POST" action="/wifisave"> <label for="ssid_list">Chọn WiFi (hoặc nhập SSID bên dưới):</label>
+    <select id="ssid_list" name="ssid_select">
+      <option value="">-- Quét để chọn --</option>
+    </select>
+    <button type="button" class="scan-btn" onclick="scanWifi()">Quét WiFi xung quanh</button>
+
+    <label for="ssid">Hoặc nhập SSID:</label>
+    <input type="text" id="ssid_manual" name="ssid_manual" placeholder="Tên mạng WiFi">
+
+    <label for="password">Mật khẩu:</label>
+    <input type="password" id="password" name="password" placeholder="Mật khẩu mạng WiFi">
+
+    <input type="submit" value="Lưu và Kết nối">
+  </form>
+  <div id="status"></div>
+  <div id="wifi_networks_title" class="hidden"><h3>Mạng Wifi tìm thấy:</h3></div>
+  <ul id="wifi_list_clickable"></ul>
+  <a href="/" class="back-link" id="backLink">Quay lại trang chính</a>
+</div>
+<script>
+function scanWifi() {
+  document.getElementById('status').textContent = 'Đang quét WiFi...';
+  document.getElementById('wifi_networks_title').classList.remove('hidden');
+  const ssidListDropdown = document.getElementById('ssid_list');
+  const wifiUlClickable = document.getElementById('wifi_list_clickable');
+  ssidListDropdown.innerHTML = '<option value="">-- Đang quét... --</option>';
+  wifiUlClickable.innerHTML = '';
+
+  fetch('/scanwifi')
+    .then(response => {
+        if (!response.ok) { throw new Error('Lỗi server khi quét WiFi: ' + response.status); }
+        return response.json();
+    })
+    .then(data => {
+      ssidListDropdown.innerHTML = '<option value="">-- Chọn từ danh sách --</option>';
+      if (data.length > 0) {
+        data.forEach(network => {
+          const option = document.createElement('option');
+          option.value = network.ssid;
+          option.textContent = `${network.ssid} (${network.rssi}dBm, ${network.secure ? 'Bảo mật' : 'Mở'})`;
+          ssidListDropdown.appendChild(option);
+
+          const li = document.createElement('li');
+          li.textContent = `${network.ssid} (${network.rssi}dBm, ${network.secure ? 'Bảo mật' : 'Mở'})`;
+          li.onclick = () => {
+            document.getElementById('ssid_manual').value = network.ssid;
+            ssidListDropdown.value = network.ssid; // Đồng bộ dropdown khi click vào list item
+            document.getElementById('password').focus();
+          };
+          wifiUlClickable.appendChild(li);
+        });
+        document.getElementById('status').textContent = 'Quét hoàn tất. Chọn một mạng.';
+      } else {
+        document.getElementById('status').textContent = 'Không tìm thấy mạng WiFi nào.';
+        ssidListDropdown.innerHTML = '<option value="">-- Không tìm thấy --</option>';
+      }
+    })
+    .catch(error => {
+      console.error('Lỗi quét WiFi:', error);
+      document.getElementById('status').textContent = 'Lỗi khi quét WiFi. ' + error.message;
+      ssidListDropdown.innerHTML = '<option value="">-- Lỗi quét --</option>';
+    });
+}
+document.getElementById('ssid_list').addEventListener('change', function() {
+    if (this.value) { // Chỉ cập nhật manual SSID nếu có giá trị được chọn từ dropdown
+        document.getElementById('ssid_manual').value = this.value;
+        document.getElementById('password').focus();
+    }
+});
+document.getElementById('wifiForm').addEventListener('submit', function(e) {
+    const manualSSID = document.getElementById('ssid_manual').value.trim();
+    const selectedSSID = document.getElementById('ssid_list').value;
+    const finalSSID = manualSSID || selectedSSID; // Ưu tiên manual, nếu rỗng thì lấy selected
+
+    if (!finalSSID) {
+        alert('Vui lòng chọn hoặc nhập SSID.');
+        e.preventDefault();
+        return;
+    }
+    // Đảm bảo rằng giá trị SSID cuối cùng được gửi đi, ngay cả khi người dùng chỉ chọn từ dropdown
+    // và không gõ vào manualSSID. Server sẽ đọc 'ssid_manual' hoặc 'ssid_select'.
+    // Để đơn giản hóa logic server, chúng ta có thể đảm bảo 'ssid_manual' luôn chứa SSID cuối cùng.
+    document.getElementById('ssid_manual').value = finalSSID;
+    document.getElementById('status').textContent = 'Đang lưu và thử kết nối... Vui lòng đợi.';
+});
+
+// Hide back link if in AP mode (192.168.4.1)
+// When accessed via /wifisetup from STA mode, hostname is STA IP, path is /wifisetup, so backlink remains.
+if (window.location.hostname.includes("192.168.4.1")) {
+    const backLink = document.getElementById('backLink');
+    if (backLink) backLink.style.display = 'none';
+}
+// MODIFIED: Removed complex condition for backlink, as it should always point to "/" (main page)
+// when not in AP mode. The default href="/" is correct.
+</script>
+</body></html>
+)rawliteral";
+
+// File Management Page
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+  <title>ESP Image Frame Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" charset="UTF-8">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; color: #333; }
+    .container { max-width: 800px; margin: auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+    h1, h2, h3 { color: #007bff; }
+    input[type="file"], input[type="submit"], button, input[type="text"], input[type="range"] { margin-top: 10px; padding: 10px; border-radius: 4px; border: 1px solid #ddd; margin-right: 10px;}
+    input[type="submit"], button { background-color: #007bff; color: white; cursor: pointer; border:none; }
+    input[type="submit"]:hover, button:hover { background-color: #0056b3; }
+    .delete-wifi-btn { background-color: #ffc107; color: black; } /* Màu vàng cho nút xóa wifi */
+    .delete-wifi-btn:hover { background-color: #e0a800; }
+    .file-list { list-style: none; padding: 0; }
+    .file-list li { background-color: #eee; padding: 8px; margin-bottom: 5px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+    .file-list button { background-color: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+    .file-list button:hover { background-color: #c82333; }
+    .section { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #eee; }
+    .section:last-child { border-bottom: none; }
+    .status { margin-top:10px; padding:10px; background-color:#e9ecef; border-radius:4px; font-style:italic; }
+    .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; } /* Style for warning messages */
+    label { display: block; margin-top: 10px; font-weight: bold;}
+    .storage-info { padding: 10px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: .25rem; margin-bottom: 1rem; }
+    .brightness-control { display: flex; align-items: center; gap: 10px; margin-bottom:10px;}
+    .brightness-control input[type="range"] { flex-grow: 1; margin-top:0; padding:0;}
+    .brightness-control span { min-width: 30px; text-align: right;}
+  </style>
+</head><body>
+  <div class="container">
+    <h1>Quản lý khung ảnh</h1>
+
+    <div class="section">
+        <h2>Thông tin bộ nhớ</h2>
+        <div id="storageStatus" class="storage-info">Đang tải thông tin bộ nhớ...</div>
+    </div>
+    
+    <div class="section">
+        <h2>Thay đổi độ sáng màn hình</h2>
+        <label for="brightnessSlider">Độ sáng:</label>
+        <div class="brightness-control">
+            <input type="range" id="brightnessSlider" min="0" max="100" value="100">
+            <span id="brightnessValue">100%</span>
+        </div>
+        <div id="statusBrightness" class="status"></div>
+    </div>
+
+    <div class="section">
+      <h2>Ảnh nền (JPEG)</h2>
+      <form id="uploadFormImage" method="POST" action="/upload-image" enctype="multipart/form-data">
+        <input type="file" name="file_upload" id="fileImage" accept=".jpg,.jpeg" required>
+        <input type="submit" value="Tải ảnh lên">
+      </form>
+      <div id="statusImage" class="status"></div>
+      <h3>Ảnh đã tải lên (/img):</h3>
+      <ul id="imageList" class="file-list"></ul>
+    </div>
+
+    <div class="section">
+      <h2>Ảnh động (GIF)</h2>
+      <form id="uploadFormAnim" method="POST" action="/upload-anim" enctype="multipart/form-data">
+        <input type="file" name="file_upload" id="fileAnim" accept=".gif,.GIF" required>
+        <input type="submit" value="Tải ảnh động GIF">
+      </form>
+      <div id="statusAnim" class="status"></div>
+      <h3>Ảnh động đã tải lên (/anim):</h3>
+      <ul id="animList" class="file-list"></ul>
+    </div>
+
+    <div class="section">
+      <h2>Cấu hình thời tiết</h2>
+      <form id="weatherConfigForm" method="POST" action="/saveweatherconfig">
+        <label for="apiKey">OpenWeatherMap API Key:</label>
+        <input type="text" id="apiKey" name="apikey" style="width: calc(100% - 22px);">
+        <label for="city">Thành phố (không dấu, VD: Ha Noi):</label>
+        <input type="text" id="city" name="city" style="width: calc(100% - 22px);">
+        <label for="countryCode">Mã Quốc gia (VD: VN):</label>
+        <input type="text" id="countryCode" name="countrycode" style="width: calc(100% - 22px);">
+        <input type="submit" value="Lưu cấu hình thời tiết">
+      </form>
+      <div id="statusWeatherConfig" class="status"></div>
+    </div>
+
+    <div class="section">
+        <h2>Cấu hình WiFi (STA Mode)</h2>
+        <p>SSID hiện tại: <strong id="currentSsid">Đang tải...</strong></p>
+        <button onclick="window.location.href='/wifisetup'">Thay đổi cấu hình WiFi</button>
+        <button onclick="deleteSavedWifi()" class="delete-wifi-btn">Xóa WiFi đã lưu & Khởi động lại</button>
+        <div id="statusWifiManage" class="status"></div>
+    </div>
+
+      <div class="section">
+        <h2>Hành động</h2>
+        <button onclick="rebootDevice()">Khởi động lại thiết bị</button>
+        <div id="statusAction" class="status"></div>
+    </div>
+  </div>
+
+<script>
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+function fetchStorageInfo() {
+    const storageElement = document.getElementById('storageStatus');
+    storageElement.textContent = 'Đang tải thông tin bộ nhớ...';
+    storageElement.classList.remove('warning'); // Xóa cảnh báo cũ
+
+    fetch('/storageinfo')
+        .then(response => {
+            if (!response.ok) {
+                return response.text().then(text => {
+                    throw new Error(`Lỗi server: ${response.status} ${response.statusText}. Chi tiết: ${text}`);
+                });
+            }
+            return response.json();
+        })
+        .then(data => {
+            if (data.error) { // Kiểm tra xem server có trả về lỗi JSON không
+                throw new Error('Lỗi từ server: ' + data.error);
+            }
+            storageElement.innerHTML = `Tổng: ${formatBytes(data.total)} | Đã dùng: ${formatBytes(data.used)} | Còn trống: ${formatBytes(data.free)}`;
+            if (data.low_memory_warning) {
+                storageElement.classList.add('warning');
+                storageElement.innerHTML += " (Bộ nhớ thấp!)";
+            }
+        })
+        .catch(error => {
+            console.error('Lấy thông tin bộ nhớ:', error);
+            storageElement.textContent = 'Không thể lấy thông tin bộ nhớ. ' + error.message;
+            storageElement.classList.add('warning');
+        });
+}
+
+
+function fetchFiles(listId, dirPath, statusId) {
+  const listElement = document.getElementById(listId);
+  const statusElement = document.getElementById(statusId);
+  statusElement.textContent = 'Đang tải danh sách tệp...';
+  listElement.innerHTML = '';
+
+  fetch('/list-files?path=' + dirPath)
+    .then(response => {
+      if (!response.ok) throw new Error('Network response was not ok: ' + response.statusText);
+      return response.json();
+    })
+    .then(data => {
+      if (data.length === 0) {
+        listElement.innerHTML = '<li>Không có tệp nào.</li>';
+      } else {
+        data.forEach(file => {
+          const li = document.createElement('li');
+          li.textContent = file.name;
+          const deleteButton = document.createElement('button');
+          deleteButton.textContent = 'Xoa';
+          deleteButton.onclick = () => {
+            console.log("Client-side deleteFile: file.name (relative):", file.name, "file.path (absolute):", file.path);
+            deleteFile(file.path, listId, dirPath, statusId);
+          };
+          li.appendChild(deleteButton);
+          listElement.appendChild(li);
+        });
+      }
+      statusElement.textContent = 'Danh sách tệp đã được cập nhật.';
+    })
+    .catch(error => {
+        console.error('Lỗi tải danh sách tệp cho ' + dirPath + ':', error);
+        statusElement.textContent = 'Lỗi tải danh sách tệp: ' + error.message;
+        listElement.innerHTML = '<li>Không thể tải danh sách tệp.</li>';
+    });
+}
+
+function deleteFile(filePath, listIdToUpdate, dirPathForUpdate, statusIdToUpdate) {
+  if (!confirm('Bạn có chắc muốn xóa ' + filePath + '?')) return;
+  console.log("deleteFile JS function: Sending path to server:", filePath);
+  const formData = new URLSearchParams();
+  formData.append('path', filePath);
+
+  fetch('/delete-file', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formData
+  })
+    .then(response => response.text().then(text => ({ ok: response.ok, text })))
+    .then(({ok, text}) => {
+      alert(text);
+      document.getElementById(statusIdToUpdate).textContent = text;
+      if (ok) {
+        fetchFiles(listIdToUpdate, dirPathForUpdate, statusIdToUpdate);
+        fetchStorageInfo(); // Cập nhật thông tin bộ nhớ sau khi xóa
+      }
+    })
+    .catch(error => {
+        console.error('Lỗi xóa tệp:', error);
+        alert('Lỗi xóa tệp: ' + error);
+        document.getElementById(statusIdToUpdate).textContent = 'Lỗi xóa tệp: ' + error.message;
+    });
+}
+
+function setupUploadForm(formId, uploadUrl, fileInputId, listIdToUpdate, dirPathForUpdate, statusId) {
+    document.getElementById(formId).addEventListener('submit', function(event) {
+        event.preventDefault();
+        const formData = new FormData();
+        const fileInput = document.getElementById(fileInputId);
+        const statusElement = document.getElementById(statusId);
+        statusElement.classList.remove('warning'); // Xóa class warning cũ (nếu có)
+
+        if (fileInput.files.length === 0) {
+            alert('Vui lòng chọn một tệp để tải lên.');
+            statusElement.textContent = 'Vui lòng chọn một tệp.';
+            return;
+        }
+        formData.append(fileInput.name, fileInput.files[0]);
+        statusElement.textContent = 'Đang tải lên ' + fileInput.files[0].name + '...';
+
+        fetch(uploadUrl, { method: 'POST', body: formData })
+            .then(response => {
+                const warningHeader = response.headers.get('X-Upload-Warning');
+                return response.text().then(text => ({ ok: response.ok, status: response.status, text, warning: warningHeader }));
+            })
+            .then(({ok, status, text, warning}) => {
+                statusElement.textContent = text;
+                if (warning) { // Nếu có cảnh báo từ server
+                    statusElement.textContent += " " + warning;
+                    statusElement.classList.add('warning'); // Thêm class warning để đổi màu nền
+                }
+                if (ok) {
+                    fileInput.value = ''; // Clear the file input
+                    fetchFiles(listIdToUpdate, dirPathForUpdate, statusId);
+                    fetchStorageInfo(); // Cập nhật thông tin bộ nhớ sau khi tải lên
+                } else {
+                   statusElement.textContent += " (Lỗi: " + status + ")";
+                   alert("Lỗi tải lên: " + text);
+                }
+            })
+            .catch(error => {
+                console.error('Lỗi tải lên:', error);
+                alert('Tải lên thất bại: ' + error);
+                statusElement.textContent = 'Tải lên thất bại: ' + error.message;
+            });
+    });
+}
+function rebootDevice() {
+    if (!confirm('Bạn có muốn khởi động lại thiết bị?')) return;
+    const statusElement = document.getElementById('statusAction');
+    statusElement.textContent = 'Đang gửi lệnh khởi động lại...';
+    fetch('/reboot', { method: 'POST' })
+        .then(response => response.text().then(text => ({ ok: response.ok, text })))
+        .then(({ok, text}) => {
+            statusElement.textContent = text;
+            if (ok) {
+                alert('Thiết bị sẽ khởi động lại.');
+            } else {
+                alert('Lỗi: ' + text);
+            }
+        })
+        .catch(error => {
+            console.error('Lỗi khởi động lại:', error);
+            statusElement.textContent = 'Lỗi khởi động lại: ' + error.message;
+            alert('Lỗi khởi động lại: ' + error.message);
+        });
+}
+
+// Load current weather config
+function loadWeatherConfig() {
+    fetch('/getweatherconfig')
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById('apiKey').value = data.apikey || '';
+            document.getElementById('city').value = data.city || '';
+            document.getElementById('countryCode').value = data.countrycode || '';
+        })
+        .catch(error => console.error('Error loading weather config:', error));
+}
+
+// Save weather config
+document.getElementById('weatherConfigForm').addEventListener('submit', function(event) {
+    event.preventDefault();
+    const formData = new FormData(this);
+    const statusElement = document.getElementById('statusWeatherConfig');
+    statusElement.textContent = 'Đang lưu cấu hình thời tiết...';
+
+    fetch('/saveweatherconfig', { method: 'POST', body: formData })
+        .then(response => response.text().then(text => ({ ok: response.ok, text })))
+        .then(({ok, text}) => {
+            statusElement.textContent = text;
+            if (!ok) {
+                alert("Lỗi lưu cấu hình: " + text);
+            } else {
+                alert("Đã lưu cấu hình thời tiết!");
+            }
+        })
+        .catch(error => {
+            console.error('Lỗi lưu cấu hình thời tiết:', error);
+            statusElement.textContent = 'Lỗi lưu cấu hình: ' + error.message;
+            alert('Lỗi lưu cấu hình thời tiết.');
+        });
+});
+
+// Get current SSID for STA mode WiFi management
+function getCurrentSsid() {
+    fetch('/getcurrentssid')
+        .then(response => {
+            if (!response.ok) throw new Error('Failed to get SSID');
+            return response.text();
+        })
+        .then(ssid => {
+            document.getElementById('currentSsid').textContent = ssid || 'Không kết nối';
+        })
+        .catch(error => {
+            console.error('Error getting current SSID:', error);
+            document.getElementById('currentSsid').textContent = 'Không thể lấy';
+        });
+}
+
+// Brightness Control
+const brightnessSlider = document.getElementById('brightnessSlider');
+const brightnessValueDisplay = document.getElementById('brightnessValue');
+const statusBrightness = document.getElementById('statusBrightness');
+
+function fetchBrightness() {
+    fetch('/get-brightness')
+        .then(response => response.json())
+        .then(data => {
+            const brightnessPercent = Math.round((data.brightness / 255) * 100);
+            brightnessSlider.value = brightnessPercent;
+            brightnessValueDisplay.textContent = brightnessPercent + '%';
+            statusBrightness.textContent = 'Đã tải độ sáng hiện tại.';
+        })
+        .catch(error => {
+            console.error('Lỗi lấy độ sáng:', error);
+            statusBrightness.textContent = 'Lỗi lấy độ sáng.';
+        });
+}
+
+brightnessSlider.addEventListener('input', function() {
+    brightnessValueDisplay.textContent = this.value + '%';
+});
+
+brightnessSlider.addEventListener('change', function() {
+    const brightnessPercent = parseInt(this.value);
+    const brightnessDeviceValue = Math.round((brightnessPercent / 100) * 255);
+
+    statusBrightness.textContent = 'Đang cập nhật độ sáng...';
+    fetch('/set-brightness?value=' + brightnessDeviceValue, { method: 'POST' })
+        .then(response => response.text())
+        .then(text => {
+            statusBrightness.textContent = text;
+        })
+        .catch(error => {
+            console.error('Lỗi đặt độ sáng:', error);
+            statusBrightness.textContent = 'Lỗi cập nhật độ sáng.';
+            fetchBrightness(); // Re-fetch to show actual current value
+        });
+});
+
+// Delete Saved WiFi
+function deleteSavedWifi() {
+    if (!confirm('Bạn có chắc muốn xóa thông tin WiFi đã lưu? Thiết bị sẽ khởi động lại ở chế độ AP.')) return;
+    const statusElement = document.getElementById('statusWifiManage');
+    statusElement.textContent = 'Đang gửi yêu cầu xóa WiFi và khởi động lại thiết bị...';
+
+    fetch('/deletewifi', { method: 'POST' })
+        .then(response => {
+            if (!response.ok) {
+                return response.text().then(text => Promise.reject(new Error(text || `Lỗi từ server: ${response.status}`)));
+            }
+            return response.text(); 
+        })
+        .then(text => { 
+            statusElement.textContent = text; 
+            alert(text); 
+            document.getElementById('currentSsid').textContent = 'Không kết nối (đang khởi động lại)';
+        })
+        .catch(error => { 
+            console.error('Lỗi khi thực hiện /deletewifi:', error);
+            let userMessage = 'Yêu cầu xóa WiFi đã được gửi. ';
+
+            if (error.message && error.message.toLowerCase().includes('failed to fetch')) {
+                userMessage += 'Thiết bị có thể đang khởi động lại ở chế độ AP. Vui lòng kiểm tra mạng WiFi "ESP32-PhotoFrame-Setup" sau ít phút.';
+            } else {
+                userMessage += 'Đã xảy ra lỗi: ' + error.message;
+            }
+            
+            statusElement.textContent = userMessage;
+            alert(userMessage);
+            document.getElementById('currentSsid').textContent = 'Không kết nối (chờ khởi động lại)';
+        });
+}
+
+
+setupUploadForm('uploadFormImage', '/upload-image', 'fileImage', 'imageList', '/img/', 'statusImage');
+setupUploadForm('uploadFormAnim', '/upload-anim', 'fileAnim', 'animList', '/anim/', 'statusAnim');
+
+fetchFiles('imageList', '/img/', 'statusImage');
+fetchFiles('animList', '/anim/', 'statusAnim');
+
+loadWeatherConfig();
+getCurrentSsid();
+fetchBrightness(); // Load initial brightness
+
+document.addEventListener('DOMContentLoaded', function() {
+    fetchStorageInfo();
+});
+
+</script>
+</body></html>
+)rawliteral";
+
+
+// --- GIF Support Functions ---
+void GIFDrawCallback(GIFDRAW *pDraw) {
+    uint8_t *s = pDraw->pPixels;      // Current line of pixels from the GIF image (palette indices)
+    uint16_t *pPal = pDraw->pPalette; // Pointer to the palette (RGB565 colors)
+
+    if (!s || !pPal || !gif.getCanvasWidth() || !gif.getCanvasHeight() || gif.getCanvasWidth() == 0 || gif.getCanvasHeight() == 0) {
+        // Serial.println("GIFDrawCallback: Invalid data or GIF not properly opened/dimensions are zero.");
+        return;
+    }
+
+    // Nếu không có active buffer (ví dụ, không cấp phát được), không làm gì cả ở đây.
+    if (currentGifDrawTarget != DRAW_TO_ACTIVE_BUFFER || !gifActiveBuffer) {
+        // Serial.println("GIFDrawCallback: Not drawing to active buffer or buffer invalid.");
+        return;
+    }
+
+    // Calculate scaling factors: source GIF dimensions to target screen area dimensions
+    float scaleX = (float)GIF_TARGET_PIXEL_WIDTH / (float)gif.getCanvasWidth();
+    float scaleY = (float)GIF_TARGET_PIXEL_HEIGHT / (float)gif.getCanvasHeight();
+
+    // y-coordinate of the current line on the original GIF canvas
+    // pDraw->iY is the Y offset of the current block on the GIF canvas.
+    // pDraw->y is the current line within this block.
+    int gif_line_y = pDraw->iY + pDraw->y;
+
+    // Determine the screen y-coordinates that this specific GIF line will cover after scaling.
+    // screen_y_start_on_target: The first screen line (relative to GIF_AREA_Y) this GIF line maps to.
+    // screen_y_end_on_target: The last screen line (relative to GIF_AREA_Y) this GIF line maps to.
+    int16_t screen_y_start_on_target = roundf((float)gif_line_y * scaleY);
+    int16_t screen_y_end_on_target = roundf((float)(gif_line_y + 1) * scaleY) - 1;
+
+    // If downscaling causes this source line to map to less than one screen pixel height,
+    // ensure it still draws if it has any coverage, or skip if it has none.
+    if (screen_y_start_on_target > screen_y_end_on_target) { // Potential for 0 height if scaleY is small
+        // Check if this source line should cover at least one screen pixel row
+        if (roundf((float)(gif_line_y + 1) * scaleY) > roundf((float)gif_line_y * scaleY) ) {
+             screen_y_end_on_target = screen_y_start_on_target; // Draw at least one line
+        } else {
+            return; // This source line is completely skipped by downscaling
+        }
+    }
+    
+    // Iterate over each pixel in the current source line provided by the callback
+    for (int i = 0; i < pDraw->iWidth; i++) { // 'i' is the x-offset within the current block of the source GIF
+        // Check if the current source pixel is transparent
+        if (s[i] == pDraw->ucTransparent) {
+            continue; // Skip drawing for transparent pixels
+        }
+
+        // x-coordinate of the current pixel on the original GIF canvas
+        // pDraw->iX is the X offset of the current block on the GIF canvas.
+        int gif_pixel_x = pDraw->iX + i;
+
+        // Determine the screen x-coordinates that this specific GIF pixel will cover after scaling.
+        int16_t screen_x_start_on_target = roundf((float)gif_pixel_x * scaleX);
+        int16_t screen_x_end_on_target = roundf((float)(gif_pixel_x + 1) * scaleX) - 1;
+
+        // If downscaling causes this source pixel to map to less than one screen pixel width
+        if (screen_x_start_on_target > screen_x_end_on_target) {
+            if (roundf((float)(gif_pixel_x + 1) * scaleX) > roundf((float)gif_pixel_x * scaleX) ) {
+                screen_x_end_on_target = screen_x_start_on_target; // Draw at least one pixel column
+            } else {
+                continue; // This source pixel is completely skipped by downscaling
+            }
+        }
+
+        // Get the color for the current GIF pixel from the palette
+        uint16_t color = pPal[s[i]];
+
+        // Fill the rectangle on the screen that this single GIF pixel maps to
+        // The loops iterate over the screen pixels (relative to the GIF target area's top-left)
+        for (int16_t sy_rel = screen_y_start_on_target; sy_rel <= screen_y_end_on_target; sy_rel++) {
+            // Clip to the target GIF area height
+            if (sy_rel < 0 || sy_rel >= GIF_TARGET_PIXEL_HEIGHT) continue;
+
+            for (int16_t sx_rel = screen_x_start_on_target; sx_rel <= screen_x_end_on_target; sx_rel++) {
+                // Clip to the target GIF area width
+                if (sx_rel < 0 || sx_rel >= GIF_TARGET_PIXEL_WIDTH) continue;
+                
+                // Vẽ vào gifActiveBuffer tại tọa độ tương đối (sx_rel, sy_rel)
+                // Kích thước của gifActiveBuffer là GIF_TARGET_PIXEL_WIDTH x GIF_TARGET_PIXEL_HEIGHT
+                if (gifActiveBuffer) { // Kiểm tra lại cho chắc chắn
+                     gifActiveBuffer[sy_rel * GIF_TARGET_PIXEL_WIDTH + sx_rel] = color;
+                }
+            }
+        }
+    }
+}
+
+
+void * GIFOpenFileLFS(const char *fname, int32_t *pFileSize) {
+    if (!littleFSReady) {
+        Serial.println("GIFOpenFileLFS: LittleFS not ready.");
+        *pFileSize = 0;
+        return NULL;
+    }
+    String corrected_fname = String(fname);
+    if (!corrected_fname.startsWith("/")) {
+        corrected_fname = "/" + corrected_fname;
+    }
+
+    gifFileHandle = LittleFS.open(corrected_fname.c_str(), "r");
+    if (!gifFileHandle) {
+        Serial.printf("GIFOpenFileLFS: Failed to open '%s'\n", corrected_fname.c_str());
+        *pFileSize = 0;
+        return NULL;
+    }
+    *pFileSize = gifFileHandle.size();
+    return &gifFileHandle;
+}
+
+void GIFCloseFileLFS(void *pHandle) {
+    if (gifFileHandle && pHandle == &gifFileHandle) {
+        gifFileHandle.close();
+    }
+}
+
+int32_t GIFReadFileLFS(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
+    if (!littleFSReady || !pFile || !pFile->fHandle) return 0;
+    int32_t iBytesRead = 0;
+    File* f = (File*)pFile->fHandle;
+
+    // Ensure we don't read past the end of the file
+    if ((pFile->iPos + iLen) > pFile->iSize) {
+        iLen = pFile->iSize - pFile->iPos;
+    }
+    if (iLen <= 0) return 0; // No more data to read or invalid length
+
+    iBytesRead = f->read(pBuf, iLen);
+    if (iBytesRead > 0) {
+      pFile->iPos += iBytesRead;
+    }
+    return iBytesRead;
+}
+
+int32_t GIFSeekFileLFS(GIFFILE *pFile, int32_t iPosition) {
+    if (!littleFSReady || !pFile || !pFile->fHandle) return -1;
+    File* f = (File*)pFile->fHandle;
+
+    if (iPosition >= pFile->iSize) { // Seeking beyond file size
+        iPosition = pFile->iSize - 1;
+    }
+    if (f->seek(iPosition, SeekSet)) {
+        pFile->iPos = iPosition;
+        return iPosition;
+    }
+    return -1; // Seek failed
+}
+
+
+// --- WiFi Manager Functions ---
+bool loadWiFiCredentials() {
+    if (!littleFSReady) {
+        Serial.println("loadWiFiCredentials: LittleFS not ready.");
+        return false;
+    }
+    Serial.println("loadWiFiCredentials: Kiem tra file cau hinh WiFi...");
+    if (LittleFS.exists(WIFI_SSID_PATH) && LittleFS.exists(WIFI_PASS_PATH)) {
+        Serial.println("loadWiFiCredentials: Tim thay file. Dang mo...");
+        File ssidFile = LittleFS.open(WIFI_SSID_PATH, "r");
+        File passFile = LittleFS.open(WIFI_PASS_PATH, "r");
+        if (ssidFile && passFile) {
+            Serial.println("loadWiFiCredentials: Mo file thanh cong.");
+            wifi_ssid_stored = ssidFile.readStringUntil('\n');
+            wifi_password_stored = passFile.readStringUntil('\n');
+            wifi_ssid_stored.trim();
+            wifi_password_stored.trim();
+            ssidFile.close();
+            passFile.close();
+            Serial.println("loadWiFiCredentials: SSID doc duoc: '" + wifi_ssid_stored + "'");
+            if (wifi_ssid_stored.length() > 0) {
+                Serial.println("loadWiFiCredentials: Load cau hinh thanh cong.");
+                return true;
+            } else {
+                Serial.println("loadWiFiCredentials: SSID doc duoc rong.");
+            }
+        } else {
+            Serial.println("loadWiFiCredentials: Loi mo mot hoac ca hai file.");
+            if (ssidFile) ssidFile.close();
+            if (passFile) passFile.close();
+        }
+    } else {
+        Serial.println("loadWiFiCredentials: Mot hoac ca hai file cau hinh khong ton tai.");
+    }
+    Serial.println("loadWiFiCredentials: Khong tim thay cau hinh WiFi hop le.");
+    return false;
+}
+
+void saveWiFiCredentials(const String& ssid, const String& password) {
+    if (!littleFSReady) {
+        Serial.println("saveWiFiCredentials: LittleFS not ready. Cannot save.");
+        return;
+    }
+    Serial.println("saveWiFiCredentials: Luu SSID: " + ssid);
+    File ssidFile = LittleFS.open(WIFI_SSID_PATH, "w");
+    if (ssidFile) {
+        ssidFile.println(ssid);
+        ssidFile.close();
+    } else {
+        Serial.println("saveWiFiCredentials: LOI mo file SSID de ghi."); return;
+    }
+
+    File passFile = LittleFS.open(WIFI_PASS_PATH, "w");
+    if (passFile) {
+        passFile.println(password);
+        passFile.close();
+    } else {
+        Serial.println("saveWiFiCredentials: LOI mo file Password de ghi.");
+    }
+    wifi_ssid_stored = ssid;
+    wifi_password_stored = password;
+}
+
+void deleteWiFiCredentials() {
+    if (!littleFSReady) {
+        Serial.println("deleteWiFiCredentials: LittleFS not ready. Cannot delete.");
+        return;
+    }
+    Serial.println("deleteWiFiCredentials: Deleting WiFi credentials...");
+    bool ssidDeleted = LittleFS.remove(WIFI_SSID_PATH);
+    bool passDeleted = LittleFS.remove(WIFI_PASS_PATH);
+
+    if (ssidDeleted) {
+        Serial.print("deleteWiFiCredentials: Deleted "); Serial.println(WIFI_SSID_PATH);
+    } else {
+        Serial.print("deleteWiFiCredentials: Failed to delete "); Serial.print(WIFI_SSID_PATH); Serial.println(" (or it didn't exist)");
+    }
+    if (passDeleted) {
+        Serial.print("deleteWiFiCredentials: Deleted "); Serial.println(WIFI_PASS_PATH);
+    } else {
+        Serial.print("deleteWiFiCredentials: Failed to delete "); Serial.print(WIFI_PASS_PATH); Serial.println(" (or it didn't exist)");
+    }
+    wifi_ssid_stored = "";
+    wifi_password_stored = "";
+}
+
+
+// --- WebServer Handlers ---
+void handleRoot() {
+    if (wifiManagerMode) { // If in AP mode, serve WiFi config
+        handleWifiConfigRoot();
+    } else { // If in STA mode, serve main page
+        server.send_P(200, "text/html", index_html);
+    }
+}
+
+// Serves the WiFi configuration page (wifi_config_html)
+void handleWifiConfigRoot() { server.send_P(200, "text/html", wifi_config_html); }
+
+// Handler for the STA mode WiFi setup page if user navigates to /wifisetup directly
+void handleSTAWifiSetupPage() {
+    server.send_P(200, "text/html", wifi_config_html);
+}
+
+
+void handleWifiSave() {
+    String new_ssid = server.hasArg("ssid_manual") ? server.arg("ssid_manual") : "";
+    if (new_ssid.isEmpty() && server.hasArg("ssid_select")) { // If manual is empty, try dropdown
+        new_ssid = server.arg("ssid_select");
+    }
+    String new_password = server.hasArg("password") ? server.arg("password") : "";
+
+    if (new_ssid.length() == 0) {
+        server.send(400, "text/plain", "SSID khong duoc de trong."); return;
+    }
+
+    gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextSize(2); gfx.setTextColor(COL_WHITE);
+    gfx.println("Dang luu cau hinh WiFi..."); gfx.printf("SSID: %s\n", new_ssid.c_str());
+    Serial.println("Thong tin WiFi nhan duoc: SSID: " + new_ssid);
+
+    saveWiFiCredentials(new_ssid, new_password);
+
+    gfx.println("Dang thu ket noi..."); Serial.println("Dang thu ket noi voi WiFi moi...");
+    WiFi.disconnect(true); WiFi.mode(WIFI_STA);
+    WiFi.begin(new_ssid.c_str(), new_password.c_str());
+
+    int ct = 0;
+    while (WiFi.status() != WL_CONNECTED && ct++ < 30) { // Timeout after ~15 seconds
+        delay(500); Serial.print("."); gfx.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nKet noi WiFi thanh cong! IP: " + WiFi.localIP().toString());
+        gfx.println("\nKet noi thanh cong!"); gfx.println("IP: " + WiFi.localIP().toString()); gfx.println("Se khoi dong lai...");
+        server.send(200, "text/html", "<h1>Da luu va ket noi WiFi thanh cong!</h1><p>Thiet bi se khoi dong lai sau vai giay.</p><script>setTimeout(function(){ window.location.href = '/'; }, 3000);</script>");
+        delay(3000); ESP.restart();
+    } else {
+        Serial.println("\nKet noi WiFi that bai."); gfx.println("\nKet noi that bai!"); gfx.println("Kiem tra lai SSID/Pass.");
+        // MODIFIED: Dynamic "Try again" link based on mode
+        String tryAgainPath = wifiManagerMode ? "/" : "/wifisetup";
+        server.send(200, "text/html", "<h1>Ket noi WiFi that bai!</h1><p>Vui long kiem tra lai SSID va mat khau. <a href='" + tryAgainPath + "'>Thu lai tu trang cau hinh</a>.</p>");
+    }
+}
+
+void handleScanWifi() {
+    Serial.println("Yeu cau quet WiFi...");
+    // Ensure WiFi is in a mode that can scan (STA or AP_STA)
+    // If in AP_ONLY mode, scanning might not work or might be limited.
+    // For simplicity, we assume it works or the user is in STA setup.
+    // WiFi.mode(WIFI_STA); // Could force STA mode if needed, but might disrupt AP if active.
+
+    int n = WiFi.scanNetworks();
+    Serial.printf("Da quet xong. Tim thay %d mang.\n", n);
+
+    String json = "[";
+    if (n > 0) {
+        // Sort networks by RSSI (strongest first)
+        std::vector<std::pair<int, int>> networks; // pair: {RSSI, original_index}
+        for (int i = 0; i < n; ++i) {
+            networks.push_back({WiFi.RSSI(i), i});
+        }
+        std::sort(networks.rbegin(), networks.rend()); // Sort descending by RSSI
+
+        for (int i = 0; i < n; ++i) {
+            int originalIndex = networks[i].second;
+            if (i > 0) json += ",";
+            json += "{";
+            json += "\"ssid\":\"" + WiFi.SSID(originalIndex) + "\"";
+            json += ",\"rssi\":" + String(WiFi.RSSI(originalIndex));
+            json += ",\"secure\":" + String(WiFi.encryptionType(originalIndex) == WIFI_AUTH_OPEN ? "false" : "true");
+            json += "}";
+        }
+    }
+    WiFi.scanDelete(); // Free scan results
+    json += "]";
+    server.send(200, "application/json", json);
+    Serial.println("Da gui danh sach WiFi JSON.");
+}
+
+void handleListFilesAPI() {
+    if (!littleFSReady) {
+        server.send(503, "text/plain", "File system not ready.");
+        return;
+    }
+    String pathParam = server.hasArg("path") ? server.arg("path") : "/";
+    if (!pathParam.startsWith("/")) {
+        pathParam = "/" + pathParam; // Ensure absolute path
+    }
+
+    // Basic path validation (prevent directory traversal if path is constructed from user input elsewhere, though here it's fixed)
+    if (pathParam.indexOf("..") != -1) {
+        server.send(400, "text/plain", "Invalid path.");
+        return;
+    }
+
+    if (!LittleFS.exists(pathParam)) {
+        Serial.printf("handleListFilesAPI: Directory not found: '%s'\n", pathParam.c_str());
+        server.send(404, "text/plain", "Directory not found: " + pathParam);
+        return;
+    }
+    File root = LittleFS.open(pathParam);
+    if(!root.isDirectory()){
+        Serial.printf("handleListFilesAPI: Not a directory: '%s'\n", pathParam.c_str());
+        server.send(500, "text/plain", "Not a directory: " + pathParam);
+        root.close();
+        return;
+    }
+
+    String jsonResponse = "[";
+    File file = root.openNextFile();
+    bool firstFile = true;
+    while (file) {
+        if (!file.isDirectory()) { // List only files
+            if (!firstFile) {
+                jsonResponse += ",";
+            }
+            firstFile = false;
+
+            String leafName = String(file.name()); // This is just the filename, e.g., "image.jpg"
+            String absolutePathForJson;
+
+            // Construct the absolute path for JSON, ensuring no double slashes
+            if (pathParam.endsWith("/")) {
+                absolutePathForJson = pathParam + leafName;
+            } else {
+                if (pathParam == "/") { // Special case for root
+                    absolutePathForJson = "/" + leafName;
+                } else {
+                    absolutePathForJson = pathParam + "/" + leafName;
+                }
+            }
+            // Just in case, though the above logic should prevent it.
+            absolutePathForJson.replace("//", "/");
+
+            String nameForDisplay = leafName; // For display, just the name is fine
+
+            jsonResponse += "{\"name\":\"" + nameForDisplay + "\",";
+            jsonResponse += "\"path\":\"" + absolutePathForJson + "\"}"; // Send absolute path
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    jsonResponse += "]";
+    server.send(200, "application/json", jsonResponse);
+}
+
+
+void handleDeleteFileAPI() {
+    if (!littleFSReady) {
+        server.send(503, "text/plain", "File system not ready. Cannot delete.");
+        return;
+    }
+    String filePathToDelete = "";
+    if (server.hasArg("path")) { // Expecting an absolute path from client like "/img/image.jpg"
+        filePathToDelete = server.arg("path");
+        Serial.printf("handleDeleteFileAPI: Raw 'path' argument from client: '%s'\n", filePathToDelete.c_str());
+    } else {
+        Serial.println("handleDeleteFileAPI: Missing 'path' argument.");
+        server.send(400, "text/plain", "Thieu tham so 'path'");
+        return;
+    }
+
+    // Validate path: must be absolute, no ".."
+    if (!filePathToDelete.startsWith("/") || filePathToDelete.indexOf("..") != -1) {
+        Serial.printf("handleDeleteFileAPI: Path '%s' is invalid.\n", filePathToDelete.c_str());
+        server.send(400, "text/plain", "Loi: Duong dan tep khong hop le. Path received: " + filePathToDelete);
+        return;
+    }
+
+    Serial.printf("handleDeleteFileAPI: Attempting to delete (absolute path check passed): '%s'\n", filePathToDelete.c_str());
+
+    // If deleting the currently playing/last played GIF, close it first
+    if (filePathToDelete.startsWith("/anim/") && (filePathToDelete == currentAnimationPath || filePathToDelete == lastGifPlayed)) {
+        Serial.println("handleDeleteFileAPI: File to delete is the current/last played GIF. Closing GIF...");
+        if (gifFileHandle && String(gifFileHandle.name()) == filePathToDelete) { // Check if the specific file handle is open
+             gif.close(); // This should internally call GIFCloseFileLFS
+             Serial.println("handleDeleteFileAPI: GIF file handle closed via gif.close().");
+        } else {
+            // If not sure which file handle is open, or if gif.close() is robust enough
+            gif.close();
+            Serial.println("handleDeleteFileAPI: Called gif.close() (general).");
+        }
+        delay(100); // Give a moment for file closure
+        lastGifPlayed = ""; // Clear last played
+        if (filePathToDelete == currentAnimationPath) {
+            currentAnimationPath = ""; // Clear current path
+        }
+        needsGifBackgroundUpdate = true; // Force background buffer update if GIF area was cleared
+    }
+
+    if (LittleFS.exists(filePathToDelete)) {
+        bool deleteSuccess = LittleFS.remove(filePathToDelete);
+        if (deleteSuccess) {
+            Serial.println("Da xoa tep: " + filePathToDelete);
+            server.send(200, "text/plain", "Da xoa tep thanh cong: " + filePathToDelete);
+            if (filePathToDelete.startsWith("/anim/")) {
+                scanAnimationFiles(); // Rescan to update list and potentially pick a new GIF
+            }
+            if (filePathToDelete == currentBackgroundImagePath) {
+                currentBackgroundImagePath = ""; // Clear current background
+                lastImageChangeTime = 0; // Trigger background change
+                needsGifBackgroundUpdate = true; // Background changed, need to update buffer
+            }
+        } else {
+            Serial.println("Loi xoa tep (LittleFS.remove failed): " + filePathToDelete);
+            server.send(500, "text/plain", "Loi xoa tep tu server");
+        }
+    } else {
+        Serial.println("handleDeleteFileAPI: Khong tim thay tep de xoa: " + filePathToDelete);
+        server.send(404, "text/plain", "Khong tim thay tep de xoa: " + filePathToDelete);
+    }
+}
+
+String uploadTargetDir = ""; // Global to store target directory based on URI
+
+void handleUpload() {
+    HTTPUpload& upload = server.upload();
+    g_uploadErrorOccurred = false;
+    g_uploadWarningMessage = ""; // Reset warning message for this upload
+
+    if (upload.status == UPLOAD_FILE_START) {
+        if (!littleFSReady) {
+            Serial.println("Upload Error: LittleFS not ready.");
+            g_uploadErrorOccurred = true;
+            g_uploadWarningMessage = "LOI: He thong file chua san sang!";
+            fsUploadFile = File();
+            return;
+        }
+
+        String filename = upload.filename;
+        if (filename.length() == 0) {
+            Serial.println("Upload Error: No filename.");
+            g_uploadErrorOccurred = true;
+            fsUploadFile = File();
+            return;
+        }
+        if (!filename.startsWith("/")) filename = "/" + filename;
+
+        String requestUri = server.uri();
+        if (requestUri.equalsIgnoreCase("/upload-image")) uploadTargetDir = "/img";
+        else if (requestUri.equalsIgnoreCase("/upload-anim")) uploadTargetDir = "/anim";
+        else {
+            Serial.println("Upload loi: URL upload khong xac dinh.");
+            g_uploadErrorOccurred = true;
+            fsUploadFile = File(); return;
+        }
+
+        if (!LittleFS.exists(uploadTargetDir)) {
+            if (LittleFS.mkdir(uploadTargetDir)) {
+                Serial.println("Da tao thu muc: " + uploadTargetDir);
+            } else {
+                Serial.println("Loi tao thu muc: " + uploadTargetDir);
+                g_uploadErrorOccurred = true;
+                fsUploadFile = File(); return;
+            }
+        }
+
+        // Kiểm tra dung lượng bộ nhớ
+        size_t totalBytes = LittleFS.totalBytes();
+        size_t usedBytes = LittleFS.usedBytes();
+        size_t freeBytes = totalBytes - usedBytes;
+        size_t fileSize = upload.totalSize;
+
+        Serial.printf("LittleFS Total: %u, Used: %u, Free: %u\n", totalBytes, usedBytes, freeBytes);
+        Serial.printf("Kich thuoc file upload: %u bytes\n", fileSize);
+
+        if (fileSize > freeBytes) {
+            Serial.println("Upload Error: Khong du bo nho de luu file.");
+            g_uploadErrorOccurred = true;
+            g_uploadWarningMessage = "LOI: Khong du bo nho!"; // Set specific error for final handler
+            fsUploadFile = File();
+            return; // Ngăn chặn việc mở file nếu không đủ dung lượng
+        } else if ((freeBytes - fileSize) < LOW_MEMORY_THRESHOLD) {
+            Serial.println("CANH BAO: Bo nho sap day sau khi tai file nay len!");
+            g_uploadWarningMessage = "CANH BAO: Bo nho sap day!";
+            // Vẫn tiếp tục tải lên nhưng sẽ gửi cảnh báo
+        }
+
+
+        String filePath = uploadTargetDir + filename;
+        filePath.replace("../", ""); // Sanitize path
+        filePath.replace("//", "/");
+
+        Serial.println("handleUpload: START, Ten file: " + filename + ", Duong dan: " + filePath);
+        fsUploadFile = LittleFS.open(filePath, "w");
+        if (!fsUploadFile) {
+            Serial.println("handleUpload: Khong the mo file de ghi: " + filePath);
+            g_uploadErrorOccurred = true;
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (fsUploadFile) {
+            size_t bytesWritten = fsUploadFile.write(upload.buf, upload.currentSize);
+            if (bytesWritten != upload.currentSize) {
+                Serial.println("handleUpload: Ghi file loi!");
+                g_uploadErrorOccurred = true;
+                fsUploadFile.close(); // Close on error
+                fsUploadFile = File(); // Invalidate file object
+            }
+        } else if (!g_uploadErrorOccurred) { // If file is not open and no prior error, this is unexpected
+            Serial.println("handleUpload: UPLOAD_FILE_WRITE called but fsUploadFile is not valid and no prior error.");
+            g_uploadErrorOccurred = true;
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (fsUploadFile) {
+            String filePath = fsUploadFile.name(); // Get name before closing
+            fsUploadFile.close();
+            if (!g_uploadErrorOccurred) {
+                Serial.println("handleUpload: END, File: " + filePath + ", Kich thuoc: " + upload.totalSize);
+                if (filePath.startsWith("/anim/")) {
+                    if (filePath == lastGifPlayed) lastGifPlayed = ""; // If overwriting current GIF, reset
+                    scanAnimationFiles(); // Rescan to include the new file
+                    needsGifBackgroundUpdate = true; // New GIF might need new background capture
+                } else if (filePath.startsWith("/img/")) {
+                    // If the uploaded image IS the current background, or if no background is set,
+                    // force a change and buffer update.
+                    if (filePath == currentBackgroundImagePath || currentBackgroundImagePath.isEmpty()) {
+                        currentBackgroundImagePath = filePath; // Ensure it's set to the new one
+                        lastImageChangeTime = 0; // Force redraw in loop
+                        needsGifBackgroundUpdate = true;
+                    } else {
+                        // If it's a new background image but not the current one,
+                        // it will be picked up by the random selection later.
+                        // No immediate action needed here for needsGifBackgroundUpdate,
+                        // as it will be handled when displayRandomBackgroundImage selects it.
+                    }
+                }
+            } else { // An error occurred during write
+                Serial.println("handleUpload: END, but an error occurred during upload. File: " + filePath);
+                LittleFS.remove(filePath); // Delete partially uploaded/corrupted file
+            }
+        } else { // fsUploadFile was not valid (e.g., failed to open)
+            Serial.println("handleUpload: END nhung file khong duoc mo hoac loi truoc do.");
+            // g_uploadErrorOccurred should already be true if fsUploadFile failed to open
+        }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Serial.println("handleUpload: ABORTED");
+        g_uploadErrorOccurred = true;
+        if (fsUploadFile) fsUploadFile.close(); // Close if open
+        // Optionally delete if a file was partially created:
+        // if (fsUploadFile && fsUploadFile.name()) LittleFS.remove(fsUploadFile.name());
+    }
+}
+
+void handleUploadFinal(String successMessage) {
+    String responseMessage = successMessage;
+    int httpCode = 200;
+
+    if (g_uploadErrorOccurred) {
+        if (g_uploadWarningMessage.startsWith("LOI:")) { // Lỗi nghiêm trọng (ví dụ: không đủ bộ nhớ)
+             responseMessage = g_uploadWarningMessage;
+        } else {
+            responseMessage = "Loi ghi file len server.";
+        }
+        httpCode = 500; // Internal Server Error
+    } else if (server.upload().filename.length() == 0) {
+        responseMessage = "Loi: Khong co ten file.";
+        httpCode = 400; // Bad Request
+    } else if (server.upload().totalSize == 0 && server.upload().filename.length() > 0) {
+        // Handle empty file upload (some browsers might send this)
+        String filename = server.upload().filename;
+        if (!filename.startsWith("/")) filename = "/" + filename;
+        String filePath = uploadTargetDir + filename;
+        filePath.replace("//","/");
+        LittleFS.remove(filePath); // Remove the empty file created
+        responseMessage = "Loi: File trong hoac khong co du lieu.";
+        httpCode = 400; // Bad Request
+    }
+    // Nếu không có lỗi nghiêm trọng, nhưng có cảnh báo
+    else if (!g_uploadWarningMessage.isEmpty() && !g_uploadWarningMessage.startsWith("LOI:")) {
+        // successMessage đã được set, thêm cảnh báo vào header
+        server.sendHeader("X-Upload-Warning", g_uploadWarningMessage);
+    }
+
+    server.send(httpCode, "text/plain", responseMessage);
+    
+    // Reset global flags for next upload
+    g_uploadErrorOccurred = false;
+    g_uploadWarningMessage = "";
+    uploadTargetDir = ""; // Reset target dir
+}
+
+
+void handleReboot() {
+    server.send(200, "text/plain", "Khoi dong lai thiet bi...");
+    delay(1000);
+    ESP.restart();
+}
+
+void handleNotFound() {
+    String message = "File Not Found\n\n";
+    message += "URI: "; message += server.uri();
+    message += "\nMethod: "; message += (server.method() == HTTP_GET) ? "GET" : "POST";
+    message += "\nArguments: "; message += server.args();
+    message += "\n";
+    for (uint8_t i = 0; i < server.args(); i++) {
+        message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+    }
+    server.send(404, "text/plain", message);
+}
+
+
+void handleGetWeatherConfig() {
+    String response = "{";
+    response += "\"apikey\":\"" + openWeatherMapApiKey + "\",";
+    response += "\"city\":\"" + city + "\",";
+    response += "\"countrycode\":\"" + countryCode + "\"";
+    response += "}";
+    server.send(200, "application/json", response);
+}
+
+void handleSaveWeatherConfig() {
+    bool changed = false;
+    if (server.hasArg("apikey")) {
+        String newApiKey = server.arg("apikey");
+        // Basic validation: not empty and different from current
+        if (newApiKey.length() > 0 && newApiKey != openWeatherMapApiKey) {
+            openWeatherMapApiKey = newApiKey;
+            changed = true;
+        }
+    }
+    if (server.hasArg("city")) {
+        String newCity = server.arg("city");
+         if (newCity.length() > 0 && newCity != city) {
+            city = newCity;
+            changed = true;
+        }
+    }
+    if (server.hasArg("countrycode")) {
+        String newCountryCode = server.arg("countrycode");
+        if (newCountryCode.length() > 0 && newCountryCode != countryCode) {
+            countryCode = newCountryCode;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        if (!littleFSReady) {
+            server.send(503, "text/plain", "File system not ready. Cannot save weather config.");
+            return;
+        }
+        DynamicJsonDocument doc(256); // Adjust size as needed
+        doc["apikey"] = openWeatherMapApiKey;
+        doc["city"] = city;
+        doc["countrycode"] = countryCode;
+
+        File configFile = LittleFS.open(WEATHER_CONFIG_PATH, "w");
+        if (!configFile) {
+            Serial.println("Lỗi mở file weather_cfg.json de ghi");
+            server.send(500, "text/plain", "Lỗi lưu cấu hình (mở file)");
+            return;
+        }
+        if (serializeJson(doc, configFile) == 0) {
+            Serial.println("Lỗi ghi vào file weather_cfg.json");
+            server.send(500, "text/plain", "Lỗi ghi cấu hình (ghi file)");
+        } else {
+            Serial.println("Đã lưu cấu hình thời tiết vào " + String(WEATHER_CONFIG_PATH));
+            server.send(200, "text/plain", "Đã lưu cấu hình thời tiết!");
+            lastWeatherUpdateTime = 0; // Force weather update
+        }
+        configFile.close();
+    } else {
+        server.send(200, "text/plain", "Không có thay đổi nào để lưu.");
+    }
+}
+
+void loadWeatherConfig() {
+    if (!littleFSReady) {
+        Serial.println("loadWeatherConfig: LittleFS not ready.");
+        return;
+    }
+    Serial.println("loadWeatherConfig: Attempting to load weather config...");
+    if (LittleFS.exists(WEATHER_CONFIG_PATH)) {
+        File configFile = LittleFS.open(WEATHER_CONFIG_PATH, "r");
+        if (configFile) {
+            Serial.println("loadWeatherConfig: Config file opened.");
+            DynamicJsonDocument doc(256);
+            DeserializationError error = deserializeJson(doc, configFile);
+            if (error) {
+                Serial.print("loadWeatherConfig: Error deserializing JSON: ");
+                Serial.println(error.c_str());
+            } else {
+                openWeatherMapApiKey = doc["apikey"] | openWeatherMapApiKey;
+                city = doc["city"] | city;
+                countryCode = doc["countrycode"] | countryCode;
+                Serial.println("Da load cau hinh thoi tiet tu file."); // Log success
+                Serial.print("API Key: "); Serial.println(openWeatherMapApiKey); // Safer print
+                Serial.print("City: "); Serial.println(city);
+                Serial.print("Country Code: "); Serial.println(countryCode);
+                Serial.flush(); // Ensure logs are sent
+            }
+            Serial.println("loadWeatherConfig: Attempting to close config file...");
+            configFile.close();
+            Serial.println("loadWeatherConfig: Config file closed.");
+        } else {
+            Serial.println("loadWeatherConfig: Khong the mo file weather_cfg.json de doc.");
+        }
+    } else {
+        Serial.println("loadWeatherConfig: File weather_cfg.json khong ton tai. Su dung gia tri mac dinh.");
+    }
+    Serial.println("loadWeatherConfig function finished.");
+    Serial.flush();
+}
+
+void handleGetCurrentSsid() {
+    if (WiFi.status() == WL_CONNECTED) {
+        server.send(200, "text/plain", WiFi.SSID());
+    } else {
+        server.send(200, "text/plain", "Khong ket noi");
+    }
+}
+
+void handleStorageInfo() {
+    if (!littleFSReady) {
+        server.send(503, "application/json", "{\"error\":\"File system not ready\"}");
+        return;
+    }
+    size_t totalBytes = LittleFS.totalBytes();
+    size_t usedBytes = LittleFS.usedBytes();
+    size_t freeBytes = totalBytes - usedBytes;
+    bool lowMemoryWarning = (freeBytes < LOW_MEMORY_THRESHOLD);
+
+    String jsonResponse = "{";
+    jsonResponse += "\"total\":" + String(totalBytes) + ",";
+    jsonResponse += "\"used\":" + String(usedBytes) + ",";
+    jsonResponse += "\"free\":" + String(freeBytes) + ",";
+    jsonResponse += "\"low_memory_warning\":" + String(lowMemoryWarning ? "true" : "false");
+    jsonResponse += "}";
+    server.send(200, "application/json", jsonResponse);
+}
+
+// --- Brightness Control Functions ---
+void setBacklightBrightness(uint8_t brightness) {
+    currentBrightness = brightness;
+    // analogWrite() trên ESP32 sử dụng LEDC. Giá trị từ 0 (tắt) đến 255 (sáng nhất) với độ phân giải 8-bit mặc định.
+    analogWrite(TFT_BL, currentBrightness); 
+    Serial.printf("Độ sáng đã đặt (analogWrite): %d%% (Value: %d)\n", (currentBrightness * 100) / 255, currentBrightness);
+}
+
+void saveBrightnessSetting(uint8_t brightness) {
+    if (!littleFSReady) {
+        Serial.println("saveBrightnessSetting: LittleFS not ready.");
+        return;
+    }
+    File file = LittleFS.open(BRIGHTNESS_CONFIG_PATH, "w");
+    if (file) {
+        file.print(brightness);
+        file.close();
+        Serial.println("Đã lưu cài đặt độ sáng: " + String(brightness));
+    } else {
+        Serial.println("Lỗi lưu cài đặt độ sáng.");
+    }
+}
+
+void loadBrightnessSetting() {
+    uint8_t loadedBrightness = 255; // Default to full brightness
+    if (littleFSReady && LittleFS.exists(BRIGHTNESS_CONFIG_PATH)) {
+        File file = LittleFS.open(BRIGHTNESS_CONFIG_PATH, "r");
+        if (file && file.available()) {
+            loadedBrightness = file.readStringUntil('\n').toInt();
+            Serial.println("Đã tải cài đặt độ sáng: " + String(loadedBrightness));
+        } else {
+            Serial.println("Lỗi đọc file độ sáng hoặc file trống. Sử dụng mặc định.");
+        }
+        if(file) file.close();
+    } else {
+        Serial.println("File độ sáng không tồn tại. Sử dụng mặc định.");
+    }
+    setBacklightBrightness(loadedBrightness); // Apply loaded or default brightness
+}
+
+void handleSetBrightness() {
+    if (server.hasArg("value")) {
+        int val = server.arg("value").toInt();
+        if (val < 0) val = 0;
+        if (val > 255) val = 255; // Giá trị nhận được từ web là 0-255
+        
+        setBacklightBrightness(static_cast<uint8_t>(val));
+        saveBrightnessSetting(currentBrightness);
+        server.send(200, "text/plain", "Đã cập nhật độ sáng thành " + String((currentBrightness * 100) / 255) + "%");
+    } else {
+        server.send(400, "text/plain", "Thiếu tham số 'value'");
+    }
+}
+
+void handleGetBrightness() {
+    // Trả về giá trị 0-255
+    String response = "{\"brightness\":" + String(currentBrightness) + "}";
+    server.send(200, "application/json", response);
+}
+
+void handleDeleteWifi() {
+    deleteWiFiCredentials(); // Delete credentials first
+
+    // Prepare the response message
+    String responseMessage = "Da xoa thong tin WiFi. Thiet bi se khoi dong lai o che do AP sau khoang 3 giay.";
+    
+    // Send the response
+    server.send(200, "text/plain", responseMessage);
+
+    // Update the display to inform the user locally
+    gfx.fillScreen(COL_BLACK);
+    gfx.setCursor(10, 10); gfx.setTextColor(COL_YELLOW); gfx.setTextSize(2);
+    gfx.println("Da xoa WiFi!");
+    gfx.setTextSize(1);
+    gfx.setCursor(10, 50);
+    gfx.println("Khoi dong lai sau 3s...");
+    gfx.setCursor(10, 70);
+    gfx.println("Vui long doi..."); // Let user know to wait for TFT message too
+
+    // Delay to allow the server to send the response and for the user to see the message on TFT
+    // Also, keep processing client requests during this delay to ensure the response is sent
+    unsigned long rebootDelayStart = millis();
+    while (millis() - rebootDelayStart < 3000) { // 3-second delay
+        server.handleClient(); // Crucial for flushing out the HTTP response
+        delay(50);             // Small delay to prevent busy-waiting and allow other tasks
+    }
+
+    ESP.restart(); // Finally, restart the device
+}
+
+
+void startAPMode() {
+    wifiManagerMode = true; // Đặt cờ cho chế độ AP
+    Serial.println("startAPMode: Khoi dong che do AP...");
+    gfx.fillScreen(COL_BLACK);
+    gfx.setCursor(10,10); gfx.setTextSize(2); gfx.setTextColor(COL_WHITE);
+    gfx.println("CHE DO CAU HINH WIFI");
+
+    WiFi.disconnect(true); // Disconnect from any STA connection
+    WiFi.mode(WIFI_AP);    // Set mode to AP
+    delay(100);            // Short delay for mode change
+
+    // Start SoftAP
+    if (AP_PASSWORD != NULL && strlen(AP_PASSWORD) >= 8) {
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
+    } else {
+        WiFi.softAP(AP_SSID); // Open network if no password or short password
+    }
+    delay(500); // Wait for AP to be fully up
+
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.println("startAPMode: AP IP address: " + apIP.toString());
+
+    gfx.setCursor(10, 50); gfx.setTextColor(COL_WHITE);
+    gfx.println("Mo WiFi:");
+    gfx.setCursor(10, 70); gfx.println(AP_SSID);
+    gfx.setCursor(10, 100); gfx.println("Truy cap IP:");
+    gfx.setCursor(10, 120); gfx.println(apIP.toString());
+
+    // Setup web server handlers for AP mode
+    server.on("/", HTTP_GET, handleWifiConfigRoot);   // Serve the WiFi config page
+    server.on("/wifisave", HTTP_POST, handleWifiSave);   // Handle saving WiFi credentials
+    server.on("/scanwifi", HTTP_GET, handleScanWifi);    // Handle WiFi scan request
+    server.onNotFound(handleWifiConfigRoot); // Redirect unknown paths to config page
+
+    server.begin();
+    Serial.println("startAPMode: WebServer da bat dau o che do AP.");
+}
+
+void startSTAModeAndMainApp() {
+    wifiManagerMode = false; // Đặt cờ cho chế độ STA
+    Serial.println("Che do Station (STA) - Chay ung dung chinh.");
+    Serial.flush();
+
+    if (littleFSReady) {
+        loadWeatherConfig();
+        loadBrightnessSetting(); // Tải cài đặt độ sáng
+        Serial.println("loadWeatherConfig() & loadBrightnessSetting() completed in startSTAModeAndMainApp.");
+    } else {
+        Serial.println("LittleFS not ready, skipping weather/brightness config load in startSTAModeAndMainApp.");
+    }
+    Serial.flush();
+
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Configuring time with NTP servers...");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServerPrimary, ntpServerSecondary);
+        Serial.println("NTP configuration initiated. Time will sync in background.");
+    }
+    Serial.flush();
+
+    Serial.println("Setting up server handlers...");
+    server.on("/", HTTP_GET, handleRoot); // Sẽ phục vụ index_html vì wifiManagerMode là false
+    server.on("/list-files", HTTP_GET, handleListFilesAPI);
+    server.on("/delete-file", HTTP_POST, handleDeleteFileAPI);
+    server.on("/reboot", HTTP_POST, handleReboot);
+    server.on("/getweatherconfig", HTTP_GET, handleGetWeatherConfig);
+    server.on("/saveweatherconfig", HTTP_POST, handleSaveWeatherConfig);
+    server.on("/getcurrentssid", HTTP_GET, handleGetCurrentSsid);
+    server.on("/storageinfo", HTTP_GET, handleStorageInfo);
+    server.on("/set-brightness", HTTP_POST, handleSetBrightness);
+    server.on("/get-brightness", HTTP_GET, handleGetBrightness);
+    server.on("/deletewifi", HTTP_POST, handleDeleteWifi); 
+
+    // ADDED: Handlers for WiFi configuration page when in STA mode
+    server.on("/wifisetup", HTTP_GET, handleSTAWifiSetupPage); // Serve wifi_config_html
+    server.on("/wifisave", HTTP_POST, handleWifiSave);         // Handle saving new credentials (uses wifiManagerMode flag)
+    server.on("/scanwifi", HTTP_GET, handleScanWifi);          // Handle scanning WiFi networks
+
+
+    // File upload handlers
+    server.on("/upload-image", HTTP_POST, [](){ handleUploadFinal("Tai anh len thanh cong!"); }, handleUpload);
+    server.on("/upload-anim", HTTP_POST, [](){ handleUploadFinal("Tai hoat anh GIF thanh cong!"); }, handleUpload);
+
+    server.onNotFound(handleNotFound);
+    Serial.flush();
+
+    Serial.println("Starting server...");
+    server.begin();
+    Serial.println("Server cho STA mode da bat dau.");
+    Serial.flush();
+
+
+    // Initialize JPEG decoder
+    TJpgDec.setJpgScale(1); // Use 1 for 1:1 decoding, 0 for auto scale (usually 1:1, 1:2, 1:4, 1:8)
+    TJpgDec.setSwapBytes(false); // Thử true nếu màu sắc bị sai
+    TJpgDec.setCallback(tft_output_callback_jpeg); // Đặt callback mặc định
+
+
+    // Initialize GIF library
+    gif.begin(GIF_PALETTE_RGB565_LE); // Or GIF_PALETTE_RGB565_BE depending on your screen's endianness
+
+    if (littleFSReady) {
+        Serial.println("Scanning animation files...");
+        scanAnimationFiles();
+        Serial.println("Animation files scan complete.");
+    }
+    Serial.flush();
+    
+    Serial.println("Fetching initial weather data (if not already done)...");
+    if (WiFi.status() == WL_CONNECTED && (lastWeatherUpdateTime == 0 || currentWeatherIconCode == "unknown")) {
+        fetchWeatherData();
+        lastWeatherUpdateTime = millis();
+    }
+    Serial.println("Weather data fetch attempt complete.");
+    Serial.flush();
+
+    if (littleFSReady) {
+        Serial.println("Displaying initial background image...");
+        displayRandomBackgroundImage(); // This will also trigger needsGifBackgroundUpdate if path changes
+        lastImageChangeTime = millis();
+        // Capture initial background for GIF if needed
+        if (needsGifBackgroundUpdate && gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+            captureAndStoreGifBackground();
+        }
+        Serial.println("Initial background image display complete.");
+    } else {
+        gfx.fillScreen(COL_BLACK);
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 - 20); gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+        gfx.println("LOI HE THONG FILE!");
+        gfx.setTextSize(1);
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 + 10);
+        gfx.println("Khong the doc/ghi file.");
+    }
+    Serial.flush();
+    Serial.println("Ung dung chinh da san sang.");
+    Serial.flush();
+}
+
+
+void setup() {
+    Serial.begin(115200);
+    unsigned long setupStartTime = millis();
+    while (!Serial && (millis() - setupStartTime < 2000)); // Wait for serial, but timeout
+    Serial.println("\nKhoi dong ESP32 Photo Frame...");
+    Serial.flush();
+
+    // Initialize GFX
+    if (!gfx.begin()) {
+        Serial.println("Loi khoi tao gfx.begin()!");
+        while (1) delay(100); // Halt
+    }
+    SCREEN_WIDTH_VAL = gfx.width();
+    SCREEN_HEIGHT_VAL = gfx.height();
+    Serial.printf("Man hinh: %d x %d\n", SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+    Serial.flush();
+
+    // Heap and PSRAM info
+    Serial.printf("Total heap: %u\n", ESP.getHeapSize());
+    Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+    if (psramFound()) {
+        Serial.printf("Total PSRAM: %u\n", ESP.getPsramSize());
+        Serial.printf("Free PSRAM: %u\n", ESP.getFreePsram());
+    } else {
+        Serial.println("PSRAM not found / not enabled.");
+    }
+    Serial.flush();
+
+    // Define colors
+    COL_BLACK = gfx.color565(0,0,0);
+    COL_WHITE = gfx.color565(255,255,255);
+    COL_RED = gfx.color565(255,0,0);
+    COL_GREEN = gfx.color565(0,255,0);
+    COL_BLUE = gfx.color565(0,0,255);
+    COL_YELLOW = gfx.color565(255,255,0);
+    COL_DARKGREY = gfx.color565(64,64,64);
+    COL_LIGHTGREY = gfx.color565(192,192,192);
+    COL_CYAN = gfx.color565(0,255,255);
+
+    gfx.fillScreen(COL_RED); // Test screen with red
+    gfx.setCursor(10, 10); gfx.setTextColor(COL_WHITE, COL_RED); gfx.setTextSize(2);
+    gfx.println("GFX OK");
+    Serial.println("GFX da khoi tao.");
+    Serial.flush();
+    delay(1000);
+    gfx.fillScreen(COL_BLACK);
+    gfx.setCursor(10, 10); gfx.setTextColor(COL_WHITE); gfx.setTextSize(1);
+    gfx.println("Dang khoi dong...");
+
+    // Tính toán kích thước GIF dựa trên CM và DPI
+    GIF_TARGET_PIXEL_HEIGHT = roundf((GIF_TARGET_HEIGHT_CM / INCH_TO_CM) * DISPLAY_DPI); // Use roundf
+    GIF_TARGET_PIXEL_WIDTH = roundf((GIF_TARGET_WIDTH_CM / INCH_TO_CM) * DISPLAY_DPI);   // Use roundf
+
+    // Tính toán vị trí GIF (bottom right, above overlay, with margin)
+    GIF_AREA_X = SCREEN_WIDTH_VAL - GIF_TARGET_PIXEL_WIDTH - GIF_MARGIN;
+    GIF_AREA_Y = SCREEN_HEIGHT_VAL - OVERLAY_HEIGHT - GIF_TARGET_PIXEL_HEIGHT - GIF_MARGIN;
+    if (GIF_AREA_Y < 0) GIF_AREA_Y = 0; // Ensure it doesn't go off-screen at the top
+
+
+    Serial.printf("GIF Area: X=%d, Y=%d, W=%d, H=%d\n", GIF_AREA_X, GIF_AREA_Y, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT);
+    Serial.flush();
+
+    // Cấp phát bộ nhớ cho GIF background buffer và active buffer
+    size_t bufferSizeBytes = (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT * sizeof(uint16_t);
+    Serial.printf("Attempting to allocate %u bytes for each GIF buffer...\n", bufferSizeBytes);
+    if (psramFound()) {
+        gifBackgroundBuffer = (uint16_t*)ps_malloc(bufferSizeBytes);
+        gifActiveBuffer = (uint16_t*)ps_malloc(bufferSizeBytes);
+        Serial.println("GIF buffers allocated in PSRAM.");
+    } else {
+        gifBackgroundBuffer = (uint16_t*)malloc(bufferSizeBytes);
+        gifActiveBuffer = (uint16_t*)malloc(bufferSizeBytes);
+        Serial.println("GIF buffers allocated in DRAM.");
+    }
+
+    if (!gifBackgroundBuffer || !gifActiveBuffer) {
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        Serial.println("Failed to allocate memory for one or both GIF buffers!");
+        Serial.println("GIF display might not work correctly or cause crashes.");
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        if(gifBackgroundBuffer) { free(gifBackgroundBuffer); gifBackgroundBuffer = nullptr; }
+        if(gifActiveBuffer) { free(gifActiveBuffer); gifActiveBuffer = nullptr; }
+    } else {
+        Serial.printf("Successfully allocated GIF buffers, each at 0x%X and 0x%X, size %u bytes\n", (uint32_t)gifBackgroundBuffer, (uint32_t)gifActiveBuffer, bufferSizeBytes);
+        // Khởi tạo buffer với màu đen ban đầu để tránh rác nếu chưa có ảnh nền
+        for(size_t i = 0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) {
+            if (gifBackgroundBuffer) gifBackgroundBuffer[i] = COL_BLACK;
+            if (gifActiveBuffer) gifActiveBuffer[i] = COL_BLACK;
+        }
+    }
+
+
+    // Backlight control setup (using analogWrite)
+    if (TFT_BL != -1) {
+        Serial.printf("Cau hinh chan den nen %d cho analogWrite\n", TFT_BL);
+    }
+
+
+    // Initialize LittleFS
+    Serial.println("setup: Khoi tao LittleFS...");
+    Serial.flush();
+    if (!LittleFS.begin(false)) { // false = don't format on fail yet
+        Serial.println("setup: Loi Mount LittleFS! Thu format...");
+        Serial.flush();
+        gfx.setCursor(10, 30); gfx.setTextColor(COL_RED); gfx.println("Loi LittleFS!");
+        gfx.println("Dang format...");
+        if (LittleFS.format()) {
+            Serial.println("setup: Format LittleFS thanh cong. Thu begin lai...");
+            Serial.flush();
+            if (!LittleFS.begin(false)) { // Try again after format
+                 Serial.println("setup: Van loi begin LittleFS sau khi format! Dung lai.");
+                 Serial.flush();
+                 gfx.println("Format loi! Check FS.");
+                 littleFSReady = false; // Đặt cờ là FS chưa sẵn sàng
+            } else {
+                littleFSReady = true;
+                Serial.println("setup: LittleFS khoi tao thanh cong sau khi format.");
+                Serial.flush();
+            }
+        } else {
+            Serial.println("setup: Format LittleFS THAT BAI! Dung lai.");
+            Serial.flush();
+            gfx.println("Format FS loi!");
+            littleFSReady = false; // Đặt cờ là FS chưa sẵn sàng
+        }
+    } else {
+        littleFSReady = true; // LittleFS đã sẵn sàng
+        Serial.println("setup: LittleFS da khoi tao xong (lan dau).");
+        Serial.flush();
+    }
+
+    if (littleFSReady) {
+        Serial.printf("LittleFS Total: %u, Used: %u, Free: %u\n",
+                        LittleFS.totalBytes(),
+                        LittleFS.usedBytes(),
+                        (LittleFS.totalBytes() - LittleFS.usedBytes()));
+        // Create necessary directories if they don't exist
+        if (!LittleFS.exists("/img")) LittleFS.mkdir("/img");
+        if (!LittleFS.exists("/anim")) LittleFS.mkdir("/anim");
+        if (!LittleFS.exists("/icon")) LittleFS.mkdir("/icon"); // For future use
+        Serial.println("setup: Da kiem tra/tao thu muc.");
+
+        // Tải cài đặt độ sáng sau khi LittleFS sẵn sàng
+        loadBrightnessSetting();
+
+    } else {
+        Serial.println("setup: LittleFS KHONG SAN SANG. Cac chuc nang lien quan den file se bi anh huong.");
+        gfx.fillScreen(COL_BLACK);
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 - 20); gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+        gfx.println("LOI HE THONG FILE!");
+        gfx.setTextSize(1);
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2 + 10);
+        gfx.println("Khong the doc/ghi file.");
+        gfx.println("Kiem tra ket noi bo nho flash.");
+        // Nếu FS không sẵn sàng, vẫn cố gắng đặt độ sáng mặc định (nếu chân BL được cấu hình)
+        if (TFT_BL != -1) {
+            setBacklightBrightness(255); // Sáng nhất nếu không load được config
+        }
+    }
+    Serial.flush();
+
+
+    // WiFi Connection Logic
+    gfx.setCursor(10, 50); gfx.setTextColor(COL_WHITE); gfx.setTextSize(1); // Reset text size
+    gfx.print("Kiem tra WiFi...");
+    if (loadWiFiCredentials()) { // loadWiFiCredentials giờ đã kiểm tra littleFSReady
+        Serial.println("setup: Co cau hinh WiFi. Thu ket noi...");
+        gfx.setCursor(10, 70); gfx.setTextColor(COL_WHITE);
+        gfx.println("Ket noi WiFi..."); gfx.print(wifi_ssid_stored);
+
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(wifi_ssid_stored.c_str(), wifi_password_stored.c_str());
+        int connect_timeout = 20; // Approx 10 seconds timeout (20 * 500ms)
+        while (WiFi.status() != WL_CONNECTED && connect_timeout-- > 0) {
+            delay(500); Serial.print("."); gfx.print(".");
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nsetup: Da ket noi WiFi thanh cong! IP: " + WiFi.localIP().toString());
+            gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextColor(COL_GREEN); gfx.setTextSize(2);
+            gfx.println("WiFi Da Ket Noi!"); gfx.setTextSize(1); gfx.println(WiFi.localIP().toString());
+            delay(2000);
+            startSTAModeAndMainApp();
+        } else {
+            Serial.println("\nsetup: Ket noi WiFi da luu THAT BAI. Chuyen sang che do AP.");
+            gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+            gfx.println("Ket noi WiFi loi!"); delay(2000);
+            startAPMode();
+        }
+    } else {
+        Serial.println("setup: Khong co thong tin WiFi hoac loi FS. Chuyen sang che do AP.");
+        gfx.fillScreen(COL_BLACK); gfx.setCursor(10,10); gfx.setTextColor(COL_YELLOW); gfx.setTextSize(2);
+        gfx.println("Chua cau hinh WiFi!"); delay(2000);
+        startAPMode();
+    }
+    Serial.println("setup: Da hoan thanh ham setup.");
+    Serial.flush();
+}
+
+// --- loop ---
+void loop() {
+    server.handleClient(); // Handle web server requests
+
+    if (wifiManagerMode) {
+        // Minimal activity in AP mode, maybe a blinking LED or screen indicator
+        gfx.setCursor(SCREEN_WIDTH_VAL - 80, 5); gfx.setTextSize(1);
+        gfx.setTextColor(COL_YELLOW);
+        gfx.print("AP MODE ");
+        static bool blink_ap = false;
+        gfx.setTextColor(blink_ap ? COL_YELLOW : COL_BLACK); // Blink a dot
+        gfx.print(".");
+        blink_ap = !blink_ap;
+        delay(500); // Slow down AP mode loop
+        return; // Don't run main application logic in AP mode
+    }
+
+    // Nếu LittleFS chưa sẵn sàng, không thực hiện các tác vụ chính
+    if (!littleFSReady) {
+        // Có thể thêm một thông báo lỗi nhấp nháy trên màn hình ở đây nếu muốn
+        delay(1000);
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    bool forceOverlayRedrawDueToBackgroundChange = false;
+
+    // 1. Handle background image and GIF change
+    if (currentTime - lastImageChangeTime > imageChangeInterval || currentBackgroundImagePath.isEmpty()) {
+        Serial.println("Time to change background and GIF.");
+        displayRandomBackgroundImage(); // Selects and draws new background, updates currentBackgroundImagePath
+        lastImageChangeTime = currentTime;
+        forceOverlayRedrawDueToBackgroundChange = true; // Signal overlay redraw
+
+        // Flag for GIF background buffer update because the underlying image has changed
+        if (!currentBackgroundImagePath.isEmpty()) { // Only if there's a valid background
+            needsGifBackgroundUpdate = true;
+            Serial.println("Background image changed. Flagging GIF background buffer for update.");
+        }
+
+        // Select a new GIF
+        Serial.println("Selecting new GIF...");
+        scanAnimationFiles(); // This will update currentAnimationPath
+        lastGifPlayed = "";   // Ensure the new (or re-selected) GIF is opened fresh by drawAnimation()
+        
+        Serial.printf("New background: %s, New GIF: %s\n", currentBackgroundImagePath.c_str(), currentAnimationPath.c_str());
+    }
+    
+    // Update GIF background buffer if needed and possible
+    if (needsGifBackgroundUpdate && gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+        captureAndStoreGifBackground(); // This will set needsGifBackgroundUpdate to false on success
+    }
+
+
+    // Determine if overlay content (clock/weather) needs an update
+    bool weatherNeedsUpdate = false;
+    if (WiFi.status() == WL_CONNECTED &&
+        (currentTime - lastWeatherUpdateTime > weatherUpdateInterval ||
+         (lastWeatherUpdateTime == 0 && currentWeatherIconCode == "unknown" && millis() > 15000L) || // Attempt after 15s if still unknown
+         currentTemperature == -999.0f )) { // Fetch if temp is invalid
+        fetchWeatherData();
+        lastWeatherUpdateTime = currentTime;
+        weatherNeedsUpdate = true;
+    }
+
+    struct tm timeinfo;
+    bool timeIsValid = getLocalTime(&timeinfo, 0); // Check if time is valid (synced with NTP)
+    bool clockNeedsUpdate = false;
+    if (timeIsValid) {
+        if (timeinfo.tm_min != lastMinuteDisplayed) {
+            clockNeedsUpdate = true;
+        }
+    }
+
+    bool shouldRedrawOverlay = forceOverlayRedrawDueToBackgroundChange || weatherNeedsUpdate || clockNeedsUpdate;
+
+    if (shouldRedrawOverlay) {
+        // If background was NOT just redrawn by displayRandomBackgroundImage, redraw it now.
+        // This happens if only clock/weather changed.
+        if (!forceOverlayRedrawDueToBackgroundChange && !currentBackgroundImagePath.isEmpty()) {
+            drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+        }
+        drawClockDisplay(&timeinfo, timeIsValid);
+        drawWeatherInfo();
+
+        if (timeIsValid && clockNeedsUpdate) {
+            lastMinuteDisplayed = timeinfo.tm_min;
+        }
+        lastOverlayRedrawTime = currentTime;
+    } else if (currentTime - lastOverlayRedrawTime > 60000L && !currentBackgroundImagePath.isEmpty()) {
+        // Periodic full redraw of overlay and background to prevent burn-in or stale display
+        drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+        bool freshTimeIsValid = getLocalTime(&timeinfo, 0); // Get fresh time for redraw
+        drawClockDisplay(&timeinfo, freshTimeIsValid);
+        drawWeatherInfo();
+        lastOverlayRedrawTime = currentTime;
+        // Periodically ensure GIF background is up-to-date if it somehow got missed
+        if (currentBackgroundImagePath != lastCapturedBackgroundImagePath && !currentBackgroundImagePath.isEmpty()){
+            needsGifBackgroundUpdate = true;
+        }
+    }
+
+    // 2. Handle GIF animation (drawn on top of background and overlay text)
+    drawAnimation();
+
+    delay(50); // Adjust for overall responsiveness and GIF smoothness. 50ms = 20 FPS for the loop.
+}
+
+// --- Drawing and Utility Functions ---
+
+void drawTextWithOutline(const String& text, int16_t x, int16_t y, uint16_t fgColor, uint16_t outlineColor, uint8_t textSize) {
+    gfx.setTextSize(textSize);
+
+    gfx.setTextColor(outlineColor); 
+    gfx.setCursor(x - 1, y); gfx.print(text);
+    gfx.setCursor(x + 1, y); gfx.print(text);
+    gfx.setCursor(x, y - 1); gfx.print(text);
+    gfx.setCursor(x, y + 1); gfx.print(text);
+
+    gfx.setTextColor(fgColor); 
+    gfx.setCursor(x, y); gfx.print(text);
+}
+
+
+bool tft_output_callback_jpeg(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (y >= SCREEN_HEIGHT_VAL) return false; // Stop drawing if it's off-screen
+    gfx.draw16bitRGBBitmap(x, y, bitmap, w, h);
+    return true; // Continue decoding
+}
+
+// Callback function to write decoded JPEG data into the GIF background buffer
+bool tft_output_to_gif_background_buffer_callback(int16_t x_on_original_image, int16_t y_on_original_image, uint16_t block_width, uint16_t block_height, uint16_t* bitmap_data) {
+    // x, y: Tọa độ góc trên bên trái của khối bitmap_data này TRÊN ẢNH GỐC đang được giải mã.
+    // w, h: Chiều rộng, chiều cao của khối bitmap_data.
+    // bitmap_data: Con trỏ đến dữ liệu pixel của khối.
+
+    if (!g_isCapturingForGifBackgroundBuffer || !gifBackgroundBuffer) {
+        return true; // Không làm gì nếu không ở chế độ capture hoặc buffer không tồn tại
+    }
+
+    // Xác định vùng giao nhau (intersection) giữa khối bitmap hiện tại và vùng chúng ta muốn "chụp"
+    // Vùng muốn chụp trên ảnh gốc: (g_captureSourceImgX, g_captureSourceImgY) kích thước (g_captureSourceWidth, g_captureSourceHeight)
+
+    int16_t src_block_x1 = x_on_original_image;
+    int16_t src_block_y1 = y_on_original_image;
+    int16_t src_block_x2 = x_on_original_image + block_width - 1;
+    int16_t src_block_y2 = y_on_original_image + block_height - 1;
+
+    int16_t target_capture_x1 = g_captureSourceImgX;
+    int16_t target_capture_y1 = g_captureSourceImgY;
+    int16_t target_capture_x2 = g_captureSourceImgX + g_captureSourceWidth - 1;
+    int16_t target_capture_y2 = g_captureSourceImgY + g_captureSourceHeight - 1;
+
+    // Tìm vùng giao nhau thực sự
+    int16_t common_x1 = max(src_block_x1, target_capture_x1);
+    int16_t common_y1 = max(src_block_y1, target_capture_y1);
+    int16_t common_x2 = min(src_block_x2, target_capture_x2);
+    int16_t common_y2 = min(src_block_y2, target_capture_y2);
+
+    // Nếu không có vùng giao nhau, bỏ qua khối này
+    if (common_x1 > common_x2 || common_y1 > common_y2) {
+        return true; // Khối này không giao với vùng cần chụp
+    }
+
+    // Tính toán kích thước của vùng giao nhau để copy
+    int16_t copy_width = common_x2 - common_x1 + 1;
+    int16_t copy_height = common_y2 - common_y1 + 1;
+
+    // Tọa độ bắt đầu đọc từ bitmap_data (dữ liệu nguồn từ TJpgDec)
+    // Đây là offset bên trong khối `bitmap_data` hiện tại.
+    int16_t src_start_x_in_block = common_x1 - src_block_x1;
+    int16_t src_start_y_in_block = common_y1 - src_block_y1;
+
+    // Tọa độ bắt đầu ghi vào gifBackgroundBuffer (buffer đích)
+    // Đây là offset bên trong `gifBackgroundBuffer`.
+    // (common_x1 - g_captureSourceImgX) là offset X bên trong vùng capture
+    int16_t dest_start_x_in_buffer = common_x1 - g_captureSourceImgX;
+    int16_t dest_start_y_in_buffer = common_y1 - g_captureSourceImgY;
+
+    // Sao chép từng dòng pixel của vùng giao nhau
+    for (int16_t yi = 0; yi < copy_height; ++yi) {
+        // Kiểm tra giới hạn Y của buffer đích
+        if ((dest_start_y_in_buffer + yi) >= g_captureSourceHeight) continue;
+
+        uint16_t* pSrc = bitmap_data + (src_start_y_in_block + yi) * block_width + src_start_x_in_block;
+        uint16_t* pDest = gifBackgroundBuffer + (dest_start_y_in_buffer + yi) * g_captureSourceWidth + dest_start_x_in_buffer;
+        
+        // Kiểm tra giới hạn X của buffer đích cho việc copy dòng
+        int16_t actual_copy_width = copy_width;
+        if ((dest_start_x_in_buffer + copy_width) > g_captureSourceWidth) {
+            actual_copy_width = g_captureSourceWidth - dest_start_x_in_buffer;
+        }
+        if(actual_copy_width <=0) continue; // Không có gì để copy nếu chiều rộng là 0 hoặc âm
+
+        memcpy(pDest, pSrc, actual_copy_width * sizeof(uint16_t));
+    }
+
+    return true; // Luôn trả về true để TJpgDec tiếp tục giải mã
+}
+
+void captureAndStoreGifBackground() {
+    if (!gifBackgroundBuffer) {
+        Serial.println("captureAndStoreGifBackground: Buffer not allocated. Cannot capture.");
+        needsGifBackgroundUpdate = true; // Vẫn cần cập nhật nếu buffer trở nên khả dụng
+        return;
+    }
+    if (currentBackgroundImagePath.isEmpty() || !littleFSReady) {
+        Serial.println("captureAndStoreGifBackground: No background image path or LittleFS not ready.");
+        // Fill buffer with black if no image, to avoid stale data from previous captures
+        for(size_t i = 0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) gifBackgroundBuffer[i] = COL_BLACK;
+        needsGifBackgroundUpdate = false; // Coi như đã "xử lý" việc không có ảnh
+        lastCapturedBackgroundImagePath = currentBackgroundImagePath; // Để không thử lại với đường dẫn rỗng liên tục
+        return;
+    }
+    if (!LittleFS.exists(currentBackgroundImagePath)) {
+        Serial.println("captureAndStoreGifBackground: Background image file does not exist: " + currentBackgroundImagePath);
+        for(size_t i = 0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) gifBackgroundBuffer[i] = COL_BLACK;
+        needsGifBackgroundUpdate = false; // Đã "xử lý" việc file không tồn tại
+        lastCapturedBackgroundImagePath = currentBackgroundImagePath; // Để không thử lại file này liên tục
+        return;
+    }
+
+    Serial.println("Starting capture of background for GIF area from: " + currentBackgroundImagePath);
+    File jpegFile = LittleFS.open(currentBackgroundImagePath, "r");
+    if (!jpegFile) {
+        Serial.println("Failed to open background image file for capture: " + currentBackgroundImagePath);
+        return;
+    }
+
+    g_isCapturingForGifBackgroundBuffer = true;
+    g_captureSourceImgX = GIF_AREA_X;
+    g_captureSourceImgY = GIF_AREA_Y;
+    g_captureSourceWidth = GIF_TARGET_PIXEL_WIDTH;
+    g_captureSourceHeight = GIF_TARGET_PIXEL_HEIGHT;
+
+    // Ensure TJpgDec settings are correct for capturing
+    TJpgDec.setJpgScale(1); // Decode at 1:1 scale for accurate capture
+    TJpgDec.setSwapBytes(false); // Match this with your gfx.draw16bitRGBBitmap expectation (thử true nếu màu sai)
+    TJpgDec.setCallback(tft_output_to_gif_background_buffer_callback); // Đặt callback tùy chỉnh
+
+    // The x, y for drawFsJpg are 0,0 because the callback handles absolute coordinates
+    // from the original image and maps them to the buffer.
+    // TJpgDec will decode the entire image, and our callback will pick out the relevant part.
+    TJpgDec.drawFsJpg(0, 0, jpegFile);
+
+    jpegFile.close();
+    TJpgDec.setCallback(tft_output_callback_jpeg); // Khôi phục callback mặc định cho việc vẽ lên TFT
+    g_isCapturingForGifBackgroundBuffer = false;
+
+    needsGifBackgroundUpdate = false; // Mark as updated
+    lastCapturedBackgroundImagePath = currentBackgroundImagePath;
+    Serial.println("Finished capturing background for GIF area.");
+}
+
+
+void drawFsImage(const String& path, int x_pos, int y_pos, int w_max /*=0*/, int h_max /*=0*/) {
+    if (!littleFSReady) return; 
+    if (path.isEmpty() || !path.startsWith("/")) {
+        Serial.println("Loi: Duong dan khong hop le hoac rong: " + path);
+        gfx.setCursor(x_pos > 0 ? x_pos : 10, y_pos > 0 ? y_pos : SCREEN_HEIGHT_VAL / 2 );
+        gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+        gfx.print("Path Err");
+        return;
+    }
+    if (!LittleFS.exists(path)) {
+        Serial.println("Loi: Khong tim thay tep: " + path);
+        gfx.setCursor(x_pos > 0 ? x_pos : 10, y_pos > 0 ? y_pos : SCREEN_HEIGHT_VAL / 2 );
+        gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+        gfx.print("File Err");
+        currentBackgroundImagePath = ""; // Clear path if file not found
+        needsGifBackgroundUpdate = true; // Need to update buffer (likely to black)
+        return;
+    }
+
+    if (path.endsWith(".jpg") || path.endsWith(".jpeg")) {
+        File jpegFile = LittleFS.open(path, "r");
+        if (!jpegFile) {
+            Serial.println("Loi mo tep JPEG: " + path);
+            gfx.setCursor(x_pos > 0 ? x_pos : 10, y_pos > 0 ? y_pos : SCREEN_HEIGHT_VAL / 2);
+            gfx.setTextColor(COL_RED); gfx.setTextSize(2);
+            gfx.print("JPEG Err");
+            return;
+        }
+        // Ensure standard callback is set for drawing to TFT
+        TJpgDec.setJpgScale(1); // Or 0 for auto-scale to fit screen if w_max/h_max are used
+        TJpgDec.setSwapBytes(false); // Adjust if colors are swapped
+        TJpgDec.setCallback(tft_output_callback_jpeg);
+        TJpgDec.drawFsJpg(x_pos, y_pos, jpegFile); // w_max, h_max are not directly used by TJpgDec.drawFsJpg
+        jpegFile.close();
+    }
+}
+
+void displayRandomBackgroundImage() {
+    if (!littleFSReady) {
+        Serial.println("displayRandomBackgroundImage: LittleFS not ready.");
+        return;
+    }
+    String dirPath = "/img";
+    File root = LittleFS.open(dirPath);
+    if (!root || !root.isDirectory()) {
+        Serial.println("Khong the mo thu muc " + dirPath);
+        gfx.fillScreen(COL_BLACK); 
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2); gfx.setTextColor(COL_WHITE); gfx.setTextSize(2);
+        gfx.println("No /img dir!");
+        if (currentBackgroundImagePath != "") needsGifBackgroundUpdate = true; // If there was a path, now it's gone
+        currentBackgroundImagePath = "";
+        return;
+    }
+
+    std::vector<String> imageFilesFullPaths;
+    File file = root.openNextFile();
+    while (file) {
+        String leafName = String(file.name()); 
+        if (!file.isDirectory() && (leafName.endsWith(".jpg") || leafName.endsWith(".jpeg"))) {
+            String fullPath = dirPath + "/" + leafName;
+            if (leafName.startsWith("/")) { // In case file.name() already includes the directory
+                fullPath = dirPath + leafName;
+                fullPath.replace("//","/"); // Avoid double slashes if dirPath is "/" and leafName starts with "/"
+            }
+            imageFilesFullPaths.push_back(fullPath);
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+
+    if (imageFilesFullPaths.empty()) {
+        Serial.println("Khong co tep JPEG nao trong " + dirPath);
+        gfx.fillScreen(COL_BLACK); 
+        gfx.setCursor(10, SCREEN_HEIGHT_VAL / 2); gfx.setTextColor(COL_WHITE); gfx.setTextSize(2);
+        gfx.println("No JPEG files!");
+        if (currentBackgroundImagePath != "") needsGifBackgroundUpdate = true;
+        currentBackgroundImagePath = "";
+        return;
+    }
+
+    String imagePathToDisplay;
+    if (imageFilesFullPaths.size() == 1) {
+        imagePathToDisplay = imageFilesFullPaths[0];
+    } else {
+        int randomIndex;
+        int attempts = 0; 
+        do {
+            randomIndex = random(imageFilesFullPaths.size());
+            imagePathToDisplay = imageFilesFullPaths[randomIndex];
+            attempts++;
+        } while (imagePathToDisplay == currentBackgroundImagePath && attempts < imageFilesFullPaths.size() * 2); // Try not to repeat immediately
+    }
+    
+    // Check if the background image path has actually changed
+    if (imagePathToDisplay != currentBackgroundImagePath || currentBackgroundImagePath.isEmpty()) {
+         currentBackgroundImagePath = imagePathToDisplay; 
+         Serial.println("Dang hien thi anh nen: " + currentBackgroundImagePath);
+         drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+         // needsGifBackgroundUpdate will be set in loop() based on comparison with lastCapturedBackgroundImagePath
+    } else if (imageFilesFullPaths.size() == 1 && currentBackgroundImagePath == imagePathToDisplay) {
+        // If only one image and it's already current, still redraw it (e.g. after GIF finishes or for periodic refresh)
+        drawFsImage(currentBackgroundImagePath, 0, 0, SCREEN_WIDTH_VAL, SCREEN_HEIGHT_VAL);
+    }
+}
+
+void drawBottomOverlay() {
+    // This function is currently empty, but kept for potential future use.
+    // The clock and weather are drawn directly in the loop or their respective functions.
+}
+
+void drawClockDisplay(struct tm *pTimeinfo, bool timeIsValid) {
+    char timeStr[6]; 
+
+    if(!timeIsValid){
+        strcpy(timeStr, "--:--");
+    } else {
+        sprintf(timeStr, "%02d:%02d", pTimeinfo->tm_hour, pTimeinfo->tm_min);
+    }
+    // Vị trí Y của đồng hồ, căn giữa trong vùng overlay
+    int clockY = (SCREEN_HEIGHT_VAL - OVERLAY_HEIGHT) + CLOCK_TEXT_Y_OFFSET;
+    drawTextWithOutline(String(timeStr), CLOCK_TEXT_X, clockY, COL_WHITE, COL_BLACK, CLOCK_FONT_SIZE);
+}
+
+
+String convertToNonAccentVietnamese(String str) {
+  str.replace("á", "a"); str.replace("à", "a"); str.replace("ả", "a");
+  str.replace("ã", "a"); str.replace("ạ", "a"); str.replace("â", "a");
+  str.replace("ấ", "a"); str.replace("ầ", "a"); str.replace("ẩ", "a");
+  str.replace("ẫ", "a"); str.replace("ậ", "a"); str.replace("ă", "a");
+  str.replace("ắ", "a"); str.replace("ằ", "a"); str.replace("ẳ", "a");
+  str.replace("ẵ", "a"); str.replace("ặ", "a");
+  str.replace("Á", "A"); str.replace("À", "A"); str.replace("Ả", "A");
+  str.replace("Ã", "A"); str.replace("Ạ", "A"); str.replace("Â", "A");
+  str.replace("Ấ", "A"); str.replace("Ầ", "A"); str.replace("Ẩ", "A");
+  str.replace("Ẫ", "A"); str.replace("Ậ", "A"); str.replace("Ă", "A");
+  str.replace("Ắ", "A"); str.replace("Ằ", "A"); str.replace("Ẳ", "A");
+  str.replace("Ẵ", "A"); str.replace("Ặ", "A");
+  str.replace("é", "e"); str.replace("è", "e"); str.replace("ẻ", "e");
+  str.replace("ẽ", "e"); str.replace("ẹ", "e"); str.replace("ê", "e");
+  str.replace("ế", "e"); str.replace("ề", "e"); str.replace("ể", "e");
+  str.replace("ễ", "e"); str.replace("ệ", "e");
+  str.replace("É", "E"); str.replace("È", "E"); str.replace("Ẻ", "E");
+  str.replace("Ẽ", "E"); str.replace("Ẹ", "E"); str.replace("Ê", "E");
+  str.replace("Ế", "E"); str.replace("Ề", "E"); str.replace("Ể", "E");
+  str.replace("Ễ", "E"); str.replace("Ệ", "E");
+  str.replace("í", "i"); str.replace("ì", "i"); str.replace("ỉ", "i");
+  str.replace("ĩ", "i"); str.replace("ị", "i");
+  str.replace("Í", "I"); str.replace("Ì", "I"); str.replace("Ỉ", "I");
+  str.replace("Ĩ", "I"); str.replace("Ị", "I");
+  str.replace("ó", "o"); str.replace("ò", "o"); str.replace("ỏ", "o");
+  str.replace("õ", "o"); str.replace("ọ", "o"); str.replace("ô", "o");
+  str.replace("ố", "o"); str.replace("ồ", "o"); str.replace("ổ", "o");
+  str.replace("ỗ", "o"); str.replace("ộ", "o"); str.replace("ơ", "o");
+  str.replace("ớ", "o"); str.replace("ờ", "o"); str.replace("ở", "o");
+  str.replace("ỡ", "o"); str.replace("ợ", "o");
+  str.replace("Ó", "O"); str.replace("Ò", "O"); str.replace("Ỏ", "O");
+  str.replace("Õ", "O"); str.replace("Ọ", "O"); str.replace("Ô", "O");
+  str.replace("Ố", "O"); str.replace("Ồ", "O"); str.replace("Ổ", "O");
+  str.replace("Ỗ", "O"); str.replace("Ộ", "O"); str.replace("Ơ", "O");
+  str.replace("Ớ", "O"); str.replace("Ờ", "O"); str.replace("Ở", "O");
+  str.replace("Ỡ", "O"); str.replace("Ợ", "O");
+  str.replace("ú", "u"); str.replace("ù", "u"); str.replace("ủ", "u");
+  str.replace("ũ", "u"); str.replace("ụ", "u"); str.replace("ư", "u");
+  str.replace("ứ", "u"); str.replace("ừ", "u"); str.replace("ử", "u");
+  str.replace("ữ", "u"); str.replace("ự", "u");
+  str.replace("Ú", "U"); str.replace("Ù", "U"); str.replace("Ủ", "U");
+  str.replace("Ũ", "U"); str.replace("Ụ", "U"); str.replace("Ư", "U");
+  str.replace("Ứ", "U"); str.replace("Ừ", "U"); str.replace("Ử", "U");
+  str.replace("Ữ", "U"); str.replace("Ự", "U");
+  str.replace("ý", "y"); str.replace("ỳ", "y"); str.replace("ỷ", "y");
+  str.replace("ỹ", "y"); str.replace("ỵ", "y");
+  str.replace("Ý", "Y"); str.replace("Ỳ", "Y"); str.replace("Ỷ", "Y");
+  str.replace("Ỹ", "Y"); str.replace("Ỵ", "Y");
+  str.replace("đ", "d"); str.replace("Đ", "D");
+  return str;
+}
+
+
+String getVietnameseWeatherDescription(String iconCode, String apiDescription) {
+    if (!apiDescription.isEmpty()) {
+        String formattedDesc = apiDescription;
+        // Capitalize first letter
+        // if (formattedDesc.length() > 0) {
+        //     formattedDesc[0] = toupper(formattedDesc[0]);
+        // }
+        return convertToNonAccentVietnamese(formattedDesc);
+    }
+    // Fallback descriptions if API description is missing (should not happen with lang=vi)
+    if (iconCode == "01d") return "It may, troi nang";
+    if (iconCode == "01n") return "It may, troi quang";
+    if (iconCode == "02d") return "May rai rac";      
+    if (iconCode == "02n") return "May rai rac";      
+    if (iconCode == "03d" || iconCode == "03n") return "May cum";
+    if (iconCode == "04d" || iconCode == "04n") return "Nhieu may";
+    if (iconCode == "09d" || iconCode == "09n") return "Mua rao";  
+    if (iconCode == "10d") return "Mua, nang gian doan";
+    if (iconCode == "10n") return "Mua";              
+    if (iconCode == "11d" || iconCode == "11n") return "Dong";   
+    if (iconCode == "13d" || iconCode == "13n") return "Tuyet";   
+    if (iconCode == "50d" || iconCode == "50n") return "Suong mu";
+    return "Khong ro"; 
+}
+
+
+void fetchWeatherData() {
+    Serial.println("fetchWeatherData called.");
+    if (WiFi.status() != WL_CONNECTED) {
+        currentWeatherIconCode = "offline"; currentTemperature = -999.0f;
+        currentWeatherDescription = "Ngoai tuyen";
+        return;
+    }
+    if (openWeatherMapApiKey.length() < 10) { 
+        Serial.println("API Key cua OpenWeatherMap khong hop le.");
+        currentWeatherIconCode = "no_key"; currentTemperature = -999.0f;
+        currentWeatherDescription = "Loi API Key";
+        return;
+    }
+
+    HTTPClient http;
+    String encodedCity = urlEncode(city); 
+    String apiURL = "http://api.openweathermap.org/data/2.5/weather?q=" + encodedCity + "," + countryCode + "&appid=" + openWeatherMapApiKey + "&units=metric&lang=vi";
+
+    Serial.println("Weather API URL: " + apiURL);
+    http.begin(apiURL); 
+    int httpResponseCode = http.GET();
+    String payload = "";
+
+    if (httpResponseCode == HTTP_CODE_OK) {
+        payload = http.getString();
+        Serial.println("Weather API Response: " + payload); 
+        DynamicJsonDocument doc(1024); 
+        DeserializationError error = deserializeJson(doc, payload);
+        if (error) {
+            Serial.print("Loi deserializeJson(): "); Serial.println(error.c_str());
+            currentWeatherIconCode = "json_err"; currentTemperature = -999.0f;
+            currentWeatherDescription = "Loi JSON";
+        } else {
+            if(doc["weather"].isNull() || !doc["weather"].is<JsonArray>() || doc["weather"].as<JsonArray>().size() == 0) {
+                Serial.println("Phan hoi JSON khong co 'weather' array hop le.");
+                currentWeatherIconCode = "bad_json"; currentTemperature = -999.0f;
+                currentWeatherDescription = "JSON sai";
+            } else {
+                JsonObject weather_0 = doc["weather"][0];
+                currentWeatherIconCode = weather_0["icon"].as<String>();
+                String apiDesc = weather_0["description"].as<String>();  
+                currentWeatherDescription = getVietnameseWeatherDescription(currentWeatherIconCode, apiDesc);
+
+                if (doc["main"].is<JsonObject>()) {
+                    currentTemperature = doc["main"]["temp"].as<float>();
+                } else {
+                    currentTemperature = -999.0f; 
+                }
+                 Serial.printf("Thoi tiet CAP NHAT: Icon: %s, Temp: %.1f C, Desc: %s\n", currentWeatherIconCode.c_str(), currentTemperature, currentWeatherDescription.c_str());
+            }
+        }
+    } else {
+        Serial.printf("Loi yeu cau HTTP thoi tiet: %d - %s\n", httpResponseCode, http.errorToString(httpResponseCode).c_str());
+        currentWeatherIconCode = "http_err"; currentTemperature = -999.0f;
+        currentWeatherDescription = "Loi HTTP";
+    }
+    http.end(); 
+}
+
+void drawWeatherInfo() {
+    // Tính toán Y cho dòng nhiệt độ (dòng đầu tiên của khối thời tiết)
+    int tempY = (SCREEN_HEIGHT_VAL - OVERLAY_HEIGHT) + WEATHER_TEXT_Y_OFFSET;
+
+    String tempStr = "";
+    if (currentTemperature > -273.0f) { // Check if temp is valid
+        char tempFormatBuffer[12];
+        snprintf(tempFormatBuffer, sizeof(tempFormatBuffer), "%.1fc", currentTemperature); 
+        tempStr = String(tempFormatBuffer);
+    } else {
+        tempStr = "--c"; 
+    }
+
+    String descriptionStr = currentWeatherDescription;
+
+    // Tính toán X để căn chỉnh khối nhiệt độ + mô tả (nếu trên 1 dòng) hoặc chỉ nhiệt độ
+    int16_t x1_temp, y1_temp;
+    uint16_t w_temp, h_temp;
+    gfx.setTextSize(WEATHER_FONT_SIZE);
+    gfx.getTextBounds(tempStr, 0, 0, &x1_temp, &y1_temp, &w_temp, &h_temp);
+    
+    int actualTextX = WEATHER_TEXT_X_OFFSET;
+    
+    // Vẽ nhiệt độ
+    drawTextWithOutline(tempStr, actualTextX, tempY, COL_WHITE, COL_BLACK, WEATHER_FONT_SIZE);
+
+    // Vẽ mô tả thời tiết ở dòng tiếp theo, bắt đầu từ cùng một X
+    if (!descriptionStr.isEmpty()) {
+        int descriptionY = tempY + WEATHER_CHAR_PIXEL_HEIGHT + WEATHER_LINE_SPACING;
+        // Kiểm tra xem dòng mô tả có bị tràn xuống dưới màn hình không
+        if (descriptionY + WEATHER_CHAR_PIXEL_HEIGHT <= SCREEN_HEIGHT_VAL) {
+             drawTextWithOutline(descriptionStr, actualTextX, descriptionY, COL_WHITE, COL_BLACK, WEATHER_FONT_SIZE);
+        } else {
+            // Nếu dòng mô tả bị tràn, có thể không vẽ hoặc vẽ một phần (hiện tại là không vẽ nếu tràn)
+            Serial.println("Weather description too long to fit on screen.");
+        }
+    }
+}
+
+
+void scanAnimationFiles() {
+    if (!littleFSReady) {
+        Serial.println("scanAnimationFiles: LittleFS not ready.");
+        animationFilesList.clear();
+        currentAnimationPath = "";
+        return;
+    }
+    animationFilesList.clear();
+    String dirPath = "/anim";
+    File animDir = LittleFS.open(dirPath);
+    if (!animDir || !animDir.isDirectory()) {
+        Serial.println("Khong the mo thu muc " + dirPath);
+        currentAnimationPath = ""; 
+        return;
+    }
+    File file = animDir.openNextFile();
+    while(file) {
+        String leafName = String(file.name());
+        if (!file.isDirectory() && (leafName.endsWith(".gif") || leafName.endsWith(".GIF"))) {
+            String fullPath = dirPath + "/" + leafName;
+            if (leafName.startsWith("/")) { // In case file.name() already includes the directory
+                fullPath = dirPath + leafName;
+                fullPath.replace("//", "/"); // Avoid double slashes
+            }
+            animationFilesList.push_back(fullPath);
+        }
+        file.close();
+        file = animDir.openNextFile();
+    }
+    animDir.close();
+
+    if (!animationFilesList.empty()) {
+        if (animationFilesList.size() == 1) { // Nếu chỉ có 1 file GIF
+            currentAnimationPath = animationFilesList[0];
+        } else if (!lastGifPlayed.isEmpty()) { // Nếu có nhiều file và đã có file phát trước đó
+            String newPath;
+            int attempts = 0; 
+            do { // Cố gắng chọn file khác với file vừa phát
+                newPath = animationFilesList[random(animationFilesList.size())];
+                attempts++;
+            } while (newPath == lastGifPlayed && attempts < (animationFilesList.size() * 2 + 5)); // Tăng số lần thử để có cơ hội cao hơn chọn file mới
+            currentAnimationPath = newPath;
+        } else { // Trường hợp chưa có file nào phát trước đó (ví dụ lần đầu)
+             currentAnimationPath = animationFilesList[random(animationFilesList.size())];
+        }
+        Serial.println("scanAnimationFiles: Da chon file GIF: " + currentAnimationPath + " (lastGifPlayed was: " + lastGifPlayed + ")");
+    } else {
+        Serial.println("Khong tim thay file GIF nao trong " + dirPath);
+        currentAnimationPath = ""; 
+    }
+}
+
+void drawAnimation() {
+    if (!littleFSReady || (!gifBackgroundBuffer || !gifActiveBuffer) ) { 
+        // Serial.println("drawAnimation: Prereqs not met (FS or buffers).");
+        if (gif.getCanvasWidth() > 0) { // Nếu có GIF đang mở, đóng lại
+            gif.close();
+        }
+        return;
+    }
+
+    if (currentAnimationPath.isEmpty()) {
+        // Nếu không có đường dẫn GIF nào được chọn (ví dụ: không có file GIF nào)
+        // Đảm bảo khu vực GIF được xóa nếu trước đó có GIF đang phát
+        if (gif.getCanvasWidth() > 0) { 
+            gif.close(); 
+            // Xóa khu vực GIF bằng cách vẽ lại nền từ buffer (nếu có) hoặc tô đen
+            if (gifBackgroundBuffer && !needsGifBackgroundUpdate) {
+                 gfx.draw16bitRGBBitmap(GIF_AREA_X, GIF_AREA_Y, gifBackgroundBuffer, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT);
+            } else {
+                 gfx.fillRect(GIF_AREA_X, GIF_AREA_Y, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT, COL_BLACK); 
+            }
+        }
+        return; 
+    }
+
+    // Mở GIF nếu cần (GIF mới hoặc GIF cũ đã đóng, hoặc đường dẫn GIF thay đổi)
+    if (lastGifPlayed != currentAnimationPath || gif.getCanvasWidth() == 0) {
+        gif.close(); // Đóng GIF cũ (nếu có)
+        
+        // Đảm bảo buffer nền được cập nhật TRƯỚC KHI mở GIF mới
+        // Điều này quan trọng nếu ảnh nền đã thay đổi nhưng GIF chưa thay đổi ngay lập tức
+        if (needsGifBackgroundUpdate && gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+            Serial.println("drawAnimation: Capturing background before opening GIF: " + currentAnimationPath);
+            captureAndStoreGifBackground();
+        }
+        
+        currentGifDrawTarget = DRAW_TO_ACTIVE_BUFFER; 
+        int openResult = gif.open(currentAnimationPath.c_str(), GIFOpenFileLFS, GIFCloseFileLFS, GIFReadFileLFS, GIFSeekFileLFS, GIFDrawCallback);
+
+        if (openResult == 1) { 
+            if (gif.getCanvasWidth() > MAX_GIF_DIMENSION || gif.getCanvasHeight() > MAX_GIF_DIMENSION) {
+                Serial.printf("WARNING: GIF '%s' too large (%dx%d). Skipping.\n", currentAnimationPath.c_str(), gif.getCanvasWidth(), gif.getCanvasHeight());
+                gif.close(); 
+                lastGifPlayed = currentAnimationPath; 
+                currentAnimationPath = ""; 
+                return;
+            }
+            lastGifPlayed = currentAnimationPath; 
+            Serial.printf("Opened GIF: %s (%dx%d)\n", currentAnimationPath.c_str(), gif.getCanvasWidth(), gif.getCanvasHeight());
+        } else { 
+            Serial.printf("Error opening GIF: %s, code: %d, lastError: %d\n", currentAnimationPath.c_str(), openResult, gif.getLastError());
+            lastGifPlayed = currentAnimationPath; 
+            currentAnimationPath = ""; 
+            return;
+        }
+    }
+
+    // Nếu GIF đã được mở và sẵn sàng
+    if (!currentAnimationPath.isEmpty() && lastGifPlayed == currentAnimationPath && gif.getCanvasWidth() > 0) {
+        // 1. Sao chép nền từ gifBackgroundBuffer sang gifActiveBuffer
+        if (gifBackgroundBuffer && gifActiveBuffer && !needsGifBackgroundUpdate) { 
+            memcpy(gifActiveBuffer, gifBackgroundBuffer, (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT * sizeof(uint16_t));
+        } else if (gifActiveBuffer) { 
+            for(size_t i=0; i < (size_t)GIF_TARGET_PIXEL_WIDTH * GIF_TARGET_PIXEL_HEIGHT; ++i) gifActiveBuffer[i] = COL_BLACK;
+            if (!gifBackgroundBuffer && !currentBackgroundImagePath.isEmpty()) {
+                 needsGifBackgroundUpdate = true;
+            }
+        } else { 
+            return;
+        }
+
+        currentGifDrawTarget = DRAW_TO_ACTIVE_BUFFER;
+        int iDecodeStatus = gif.playFrame(true, nullptr); 
+
+        if (iDecodeStatus == 1) { 
+            if (gifActiveBuffer) { 
+                gfx.draw16bitRGBBitmap(GIF_AREA_X, GIF_AREA_Y, gifActiveBuffer, GIF_TARGET_PIXEL_WIDTH, GIF_TARGET_PIXEL_HEIGHT);
+            }
+        } else if (iDecodeStatus == 0) { // Kết thúc một chu kỳ animation
+            Serial.println("GIF animation loop finished: " + currentAnimationPath + ". Resetting to loop.");
+            gif.reset(); // Reset để GIF có thể lặp lại từ đầu
+            // Không cần làm gì thêm ở đây, GIF sẽ tiếp tục lặp lại trong lần gọi drawAnimation() tiếp theo
+            // Việc chọn GIF mới sẽ do logic trong hàm loop() quyết định khi đến lúc đổi ảnh nền
+        } else if (iDecodeStatus < 0) { // Lỗi giải mã
+             Serial.printf("Error decoding GIF frame: %d, path: %s, lastError: %d\n", iDecodeStatus, currentAnimationPath.c_str(), gif.getLastError());
+            gif.close(); 
+            lastGifPlayed = currentAnimationPath; 
+            currentAnimationPath = ""; 
+        }
+    }
+}
+
+String urlEncode(String str) {
+    String encodedString = "";
+    char c;
+    char code0;
+    char code1;
+    for (unsigned int i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (c == ' ') {
+            encodedString += "%20";
+        } else if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encodedString += c;
+        } else {
+            code1 = (c & 0xf) + '0';
+            if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
+            c = (c >> 4) & 0xf;
+            code0 = c + '0';
+            if (c > 9) code0 = c - 10 + 'A';
+            encodedString += '%';
+            encodedString += code0;
+            encodedString += code1;
+        }
+    }
+    return encodedString;
+}
